@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmo-maid-sdk"
+dynamic = ["version"]
+description = "SDK for building MMO Maid Marketplace plugins"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://mmomaid.com/dev"
+Documentation = "https://mmomaid.com/dev/docs"
+Repository = "https://github.com/NotUSeee/mmo-maid-sdk"
+Issues = "https://github.com/NotUSeee/mmo-maid-sdk/issues"
+
+[project.scripts]
+mmo = "mmo_maid_sdk.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mmo_maid_sdk*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mmo_maid_sdk.__version__"}
