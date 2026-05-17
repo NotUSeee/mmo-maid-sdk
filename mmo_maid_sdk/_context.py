@@ -49,6 +49,65 @@ if TYPE_CHECKING:
     from ._transport import Transport
 
 
+class _SecretsApi:
+    """ctx.secrets — encrypted per-plugin secrets (requires storage:secrets capability).
+
+    Plugins use this to read sensitive values the dev configured in the dev
+    portal (API keys, signing secrets, etc.) without committing them to git.
+    Values are encrypted at rest with AES-GCM via the platform's master key.
+
+    Resolution order:
+      1. ``ctx.secrets.get("FOO")`` first checks for a per-server override at
+         the current server (set by the plugin itself via ``ctx.secrets.set``
+         or by an admin in a future per-server UI).
+      2. Falls back to the dev-level default set by the plugin author in the
+         dev portal Settings → Plugin secrets page.
+      3. Returns None if neither is set.
+
+    Per-server values are scoped to ``ctx.server_id``. They never bleed
+    across servers, never leak into KV, never appear in plugin stdout or
+    logs.
+    """
+
+    def __init__(self, transport: "Transport") -> None:
+        self._t = transport
+
+    def get(self, key: str) -> Optional[str]:
+        """Read a secret. Returns None if not set.
+
+        Args:
+            key: 1-64 chars, letters/digits/underscore/hyphen/dot only.
+
+        Returns:
+            Plaintext secret, or None if not set at either scope.
+        """
+        result = self._t.call("secrets.get", {"key": str(key)})
+        if isinstance(result, dict) and "value" in result:
+            v = result["value"]
+            return str(v) if v is not None else None
+        return None
+
+    def set(self, key: str, value: str) -> None:
+        """Store a per-server secret.
+
+        Per-server values override the dev-level default for the current
+        ``ctx.server_id`` only. To clear a value, call ``ctx.secrets.delete``.
+
+        Args:
+            key: 1-64 chars (alphanumeric + _.-).
+            value: 1-4096 chars (UTF-8).
+        """
+        self._t.call("secrets.set", {"key": str(key), "value": str(value)})
+
+    def delete(self, key: str) -> None:
+        """Remove a per-server secret. No-op if not set.
+
+        Note: this only deletes the per-server override. The dev-level
+        default (set in the dashboard) is unaffected.
+        """
+        self._t.call("secrets.del", {"key": str(key)})
+
+
 class _KvApi:
     """ctx.kv — key-value storage (requires storage:kv capability)."""
 
@@ -215,11 +274,17 @@ class _DiscordApi:
         message_id: str,
         content: Optional[str] = None,
         embeds: Optional[List[Dict[str, Any]]] = None,
+        components: Optional[list] = None,
     ) -> Dict[str, Any]:
         """Edit an existing message.  Only bot-owned messages can be edited.
 
         Requires capability: discord:edit_message
-        Pass None to leave content/embeds unchanged.
+
+        Pass ``None`` to leave a field unchanged. Pass an empty list to
+        clear that field:
+          - ``content=""`` — clear text
+          - ``embeds=[]`` — clear all embeds
+          - ``components=[]`` — clear all buttons / select menus
         """
         params: Dict[str, Any] = {
             "channel_id": str(channel_id),
@@ -229,6 +294,10 @@ class _DiscordApi:
             params["content"] = str(content)
         if embeds is not None:
             params["embeds"] = embeds
+        if components is not None:
+            params["components"] = [
+                c.to_dict() if hasattr(c, "to_dict") else c for c in components
+            ]
         result = self._t.call("discord.edit_message", params)
         return result if isinstance(result, dict) else {}
 
@@ -726,23 +795,48 @@ class _HttpApi:
 
     def request(
         self, method: str, url: str,
-        *, headers: Optional[Dict[str, str]] = None, body: Optional[str] = None,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        body: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Make an HTTP request.  Only approved domains are reachable.
 
+        ``params`` is a dict of query-string parameters; values may be
+        strings or lists of strings (lists are encoded as repeated keys,
+        e.g. ``{"k": ["a", "b"]}`` becomes ``k=a&k=b``). The encoded query
+        string is appended to ``url`` with the correct separator (``?``
+        or ``&``).
+
         Returns: status (int), headers (dict), body_bytes (str), truncated (bool).
         """
+        if params:
+            import urllib.parse as _up
+            query_string = _up.urlencode(params, doseq=True)
+            if query_string:
+                url = f"{url}{'&' if '?' in url else '?'}{query_string}"
         result = self._t.call("proxy.request", {
             "method": method.upper(), "url": url,
             "headers": headers or {}, "body": body,
         })
         return result or {}
 
-    def get(self, url: str, *, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        return self.request("GET", url, headers=headers)
+    def get(
+        self, url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self.request("GET", url, headers=headers, params=params)
 
-    def post(self, url: str, *, body: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        return self.request("POST", url, headers=headers, body=body)
+    def post(
+        self, url: str,
+        *,
+        body: str,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self.request("POST", url, headers=headers, body=body, params=params)
 
 
 class _InteractionApi:
@@ -817,10 +911,16 @@ class _InteractionApi:
         components: Optional[list] = None,
         ephemeral: bool = False,
         allowed_mentions: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """Send a follow-up message after defer().
 
         Can be called multiple times. Each creates a new message.
+
+        Returns a dict with the created message's identifiers — at
+        minimum ``{"message_id": str, "channel_id": str}`` — so you can
+        edit or delete it later. Returns an empty dict if the platform
+        could not capture the response (e.g. transient parse failure);
+        the message was still sent in that case.
 
         See ``respond()`` for ``allowed_mentions`` semantics.
         """
@@ -832,7 +932,8 @@ class _InteractionApi:
         }
         if allowed_mentions is not None:
             payload["allowed_mentions"] = allowed_mentions
-        self._t.call("interaction.followup", payload)
+        result = self._t.call("interaction.followup", payload)
+        return result if isinstance(result, dict) else {}
 
     def send_modal(
         self,
@@ -903,7 +1004,19 @@ class Context:
         self.metrics     = _MetricsApi(transport)
         self.sql         = _SqlApi(transport)
         self.ephemeral   = _EphemeralApi(transport)
+        self.secrets     = _SecretsApi(transport)
         self._current_interaction_id: Optional[str] = None
+
+    @property
+    def request_id(self) -> str:
+        """Stable correlation ID for the current event.
+
+        Returns the Discord interaction ID inside an ``interaction_create``
+        handler, or an empty string outside an event. Pass this through
+        ``ctx.log(..., request_id=ctx.request_id)`` to correlate log lines
+        across handler entry, RPC calls, and downstream work.
+        """
+        return self._current_interaction_id or ""
 
     def log(self, message: str, *, level: str = "info", tags: Optional[List[str]] = None, **extra) -> None:
         """Write to the plugin audit log.  Visible to server admins in the dashboard.

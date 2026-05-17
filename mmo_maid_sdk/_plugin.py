@@ -148,22 +148,45 @@ class Plugin:
             return fn
         return decorator
 
-    def on_component(self, custom_id: str) -> Callable:
+    def on_component(
+        self,
+        custom_id: Optional[str] = None,
+        *,
+        prefix: Optional[str] = None,
+    ) -> Callable:
         """Register a handler for a component interaction (button click, select, etc.).
 
-        Convenience wrapper that filters interaction_create events by custom_id.
-        The function receives two arguments: ctx (Context) and event (dict).
+        Pass either ``custom_id="exact_id"`` for an exact-string match, or
+        ``prefix="page:"`` to match any ``custom_id`` starting with that
+        prefix. Use ``prefix=`` when your buttons encode dynamic state
+        (e.g. ``"page:next:5"``, ``"vote:yes:42"``).
+
+        Exactly one of ``custom_id=`` or ``prefix=`` must be provided.
 
         Example::
 
             @plugin.on_component("btn_join")
             def handle_join(ctx, event):
                 ctx.interaction.respond(content="You joined!", ephemeral=True)
+
+            @plugin.on_component(prefix="page:")
+            def handle_page(ctx, event):
+                # event["custom_id"] e.g. "page:next:5"
+                ...
         """
+        if (custom_id is None) == (prefix is None):
+            raise ValueError(
+                "on_component requires exactly one of custom_id= or prefix="
+            )
+
         def decorator(fn: Callable) -> Callable:
             def filtered_handler(ctx, event):
-                if (event.get("interaction_type") == 3  # MESSAGE_COMPONENT
-                        and event.get("custom_id") == custom_id):
+                if event.get("interaction_type") != 3:  # MESSAGE_COMPONENT
+                    return
+                cid = event.get("custom_id", "")
+                if custom_id is not None and cid == custom_id:
+                    return fn(ctx, event)
+                if prefix is not None and isinstance(cid, str) and cid.startswith(prefix):
                     return fn(ctx, event)
             self._event_handlers.setdefault("interaction_create", []).append(filtered_handler)
             return fn
