@@ -24,17 +24,84 @@ import time
 from typing import Any, Dict, List, Optional
 
 
-class _MockKv:
-    """In-memory KV store for testing. Thread-safe."""
+class MockClock:
+    """Clock abstraction for deterministic time-dependent tests (0.5.4+).
+
+    By default tracks wall clock — existing tests that construct
+    ``MockContext()`` without passing a clock see no behavioral change.
+
+    For deterministic tests of TTLs, cooldowns, or scheduled paths,
+    pass ``start=<float>`` to freeze time, then call ``advance(seconds)``
+    to step forward::
+
+        clock = MockClock(start=1000.0)
+        ctx = MockContext(clock=clock)
+        ctx.kv.set("k", "v", ttl_seconds=30)
+        clock.advance(31)
+        assert ctx.kv.get("k") is None  # expired
+
+    The wall-clock default mode raises ``RuntimeError`` on ``advance()``
+    so the failure mode is loud rather than silently doing nothing.
+    """
+
+    def __init__(self, start: Optional[float] = None) -> None:
+        # start=None → wall-clock passthrough (backwards-compatible default)
+        # start=<float> → frozen at that epoch; advance() steps it forward
+        self._frozen_now: Optional[float] = start
+
+    def now(self) -> float:
+        if self._frozen_now is None:
+            return time.time()
+        return self._frozen_now
+
+    def advance(self, seconds: float) -> None:
+        if self._frozen_now is None:
+            raise RuntimeError(
+                "MockClock() defaults to wall-clock mode and cannot be "
+                "advanced. Construct as MockClock(start=<epoch>) to enable "
+                "advance()."
+            )
+        self._frozen_now += float(seconds)
+
+
+class _MockSecrets:
+    """In-memory plugin secrets store for testing (0.5.4+).
+
+    Mirrors the ctx.secrets API: get returns None for unset keys, set/delete
+    operate per-server (the mock just uses a flat dict keyed by key name —
+    real per-server scoping is exercised in integration tests).
+    """
 
     def __init__(self) -> None:
         import threading
         self._lock = threading.Lock()
+        self._store: Dict[str, str] = {}
+
+    def get(self, key: str) -> Optional[str]:
+        with self._lock:
+            return self._store.get(str(key))
+
+    def set(self, key: str, value: str) -> None:
+        with self._lock:
+            self._store[str(key)] = str(value)
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._store.pop(str(key), None)
+
+
+class _MockKv:
+    """In-memory KV store for testing. Thread-safe."""
+
+    def __init__(self, clock: Optional[MockClock] = None) -> None:
+        import threading
+        self._lock = threading.Lock()
         self._store: Dict[str, Any] = {}
         self._ttls: Dict[str, float] = {}  # key -> expiry timestamp
+        self._clock = clock or MockClock()
 
     def _is_expired(self, key: str) -> bool:
-        if key in self._ttls and self._ttls[key] < time.time():
+        if key in self._ttls and self._ttls[key] < self._clock.now():
             del self._store[key]
             del self._ttls[key]
             return True
@@ -50,7 +117,7 @@ class _MockKv:
         with self._lock:
             self._store[key] = value
             if ttl_seconds > 0:
-                self._ttls[key] = time.time() + ttl_seconds
+                self._ttls[key] = self._clock.now() + ttl_seconds
             elif key in self._ttls:
                 del self._ttls[key]
 
@@ -136,8 +203,11 @@ class _MockDiscord:
         self.messages_sent.append(msg)
         return {"ok": True, "message_id": msg["message_id"], "channel_id": channel_id}
 
-    def edit_message(self, *, channel_id: str, message_id: str, content=None, embeds=None) -> Dict[str, Any]:
-        self.messages_edited.append({"channel_id": channel_id, "message_id": message_id, "content": content, "embeds": embeds})
+    def edit_message(self, *, channel_id: str, message_id: str, content=None, embeds=None, components=None) -> Dict[str, Any]:
+        self.messages_edited.append({
+            "channel_id": channel_id, "message_id": message_id,
+            "content": content, "embeds": embeds, "components": components,
+        })
         return {"ok": True}
 
     def delete_message(self, *, channel_id: str, message_id: str) -> None:
@@ -299,14 +369,25 @@ class _MockInteraction:
         self.followups: List[Dict[str, Any]] = []
         self.modals_sent: List[Dict[str, Any]] = []
 
-    def respond(self, content: str = "", embeds=None, components=None, ephemeral: bool = False) -> None:
-        self.responses.append({"content": content, "embeds": embeds, "components": components, "ephemeral": ephemeral})
+    def respond(self, content: str = "", embeds=None, components=None, ephemeral: bool = False, allowed_mentions=None) -> None:
+        self.responses.append({
+            "content": content, "embeds": embeds, "components": components,
+            "ephemeral": ephemeral, "allowed_mentions": allowed_mentions,
+        })
 
     def defer(self, ephemeral: bool = False) -> None:
         self.defers.append({"ephemeral": ephemeral})
 
-    def followup(self, content: str = "", embeds=None, components=None, ephemeral: bool = False) -> None:
-        self.followups.append({"content": content, "embeds": embeds, "components": components, "ephemeral": ephemeral})
+    def followup(self, content: str = "", embeds=None, components=None, ephemeral: bool = False, allowed_mentions=None) -> Dict[str, Any]:
+        msg_id = str(len(self.followups) + 1)
+        self.followups.append({
+            "content": content, "embeds": embeds, "components": components,
+            "ephemeral": ephemeral, "allowed_mentions": allowed_mentions,
+            "message_id": msg_id,
+        })
+        # Match real Context: followup() returns {message_id, channel_id}
+        # (the channel_id is unknown in the mock — return empty string).
+        return {"message_id": msg_id, "channel_id": ""}
 
     def send_modal(self, title: str, custom_id: str, fields=None) -> None:
         self.modals_sent.append({"title": title, "custom_id": custom_id, "fields": fields})
@@ -354,41 +435,37 @@ class _MockSql:
 class _MockEphemeral:
     """In-memory ephemeral state matching _EphemeralApi interface."""
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Optional[MockClock] = None) -> None:
         self._counters: Dict[str, int] = {}
         self._cooldowns: Dict[str, float] = {}  # key -> expiry timestamp
         self._seen: Dict[str, float] = {}  # key -> expiry timestamp
         self._flags: Dict[str, float] = {}  # key -> expiry timestamp
+        self._clock = clock or MockClock()
 
     def counter(self, key: str, window_seconds: int = 60) -> int:
         self._counters[key] = self._counters.get(key, 0) + 1
         return self._counters[key]
 
     def cooldown_set(self, key: str, ttl_seconds: int = 60) -> None:
-        import time
-        self._cooldowns[key] = time.time() + ttl_seconds
+        self._cooldowns[key] = self._clock.now() + ttl_seconds
 
     def cooldown_check(self, key: str) -> Dict[str, Any]:
-        import time
         expiry = self._cooldowns.get(key, 0)
-        remaining = max(0, expiry - time.time())
+        remaining = max(0, expiry - self._clock.now())
         return {"active": remaining > 0, "remaining_seconds": remaining}
 
     def dedup(self, key: str, ttl_seconds: int = 3600) -> bool:
-        import time
-        now = time.time()
+        now = self._clock.now()
         if key in self._seen and self._seen[key] > now:
             return False  # already seen
         self._seen[key] = now + ttl_seconds
         return True  # first time
 
     def flag_set(self, key: str, ttl_seconds: int = 3600) -> None:
-        import time
-        self._flags[key] = time.time() + ttl_seconds
+        self._flags[key] = self._clock.now() + ttl_seconds
 
     def flag_check(self, key: str) -> bool:
-        import time
-        return self._flags.get(key, 0) > time.time()
+        return self._flags.get(key, 0) > self._clock.now()
 
 
 class MockContext:
@@ -407,26 +484,37 @@ class MockContext:
         plugin_id: str = "test_plugin",
         version: str = "1.0.0",
         capabilities: Optional[List[str]] = None,
+        clock: Optional[MockClock] = None,
     ) -> None:
         self.server_id = server_id
         self.plugin_id = plugin_id
         self.version = version
         self.capabilities = set(capabilities or [
-            "storage:kv", "discord:send_message", "discord:edit_message",
+            "storage:kv", "storage:sql", "storage:secrets",
+            "discord:send_message", "discord:edit_message",
             "discord:delete_message", "discord:add_reaction", "discord:read",
             "discord:manage_channels", "discord:moderate_members",
             "discord:ban_members", "discord:kick_members", "discord:manage_roles",
             "discord:manage_webhooks", "interaction:respond", "proxy:http",
         ])
-        self.kv = _MockKv()
+        # Synthetic clock for deterministic TTL/cooldown tests; defaults to
+        # wall-clock passthrough so existing tests are unaffected.
+        self.clock = clock or MockClock()
+        self.kv = _MockKv(clock=self.clock)
         self.discord = _MockDiscord()
         self.http = _MockHttp()
         self.interaction = _MockInteraction()
         self.metrics = _MockMetrics()
         self.sql = _MockSql()
-        self.ephemeral = _MockEphemeral()
+        self.ephemeral = _MockEphemeral(clock=self.clock)
+        self.secrets = _MockSecrets()
         self.log_entries: List[Dict[str, Any]] = []
         self._current_interaction_id: Optional[str] = None
+
+    @property
+    def request_id(self) -> str:
+        """Mirror of Context.request_id (added in SDK 0.5.3)."""
+        return self._current_interaction_id or ""
 
     def log(self, message: str, level: str = "info", tags: Optional[List[str]] = None, **extra) -> None:
         self.log_entries.append({"message": message, "level": level, "tags": tags or [], **extra})

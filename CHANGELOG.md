@@ -5,6 +5,54 @@ All notable changes to the MMO Maid SDK are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] — 2026-05-17
+
+This release closes test-harness gaps reported by the Trivium plugin author
+after adopting 0.5.3 in production. Real ``Context`` surface is unchanged —
+all the additions here are in ``mmo_maid_sdk.testing`` only.
+
+A companion platform patch (server-side, no SDK code) shipped alongside this
+release to fix three regressions that survived 0.5.3 (``list_roles``
+permissions returning ``"None"`` for managed roles, ``ctx.discord.get_guild()``
+404'ing through shard-token routing, and slash-command updates skipping
+Discord-side sync after auto-update). Plugins see those fixes automatically
+on the next platform deploy — no SDK upgrade required.
+
+### Added (testing module)
+
+- **``MockClock``** — synthetic clock for deterministic time-dependent tests.
+  Default behavior is wall-clock passthrough (existing tests unchanged); pass
+  ``MockClock(start=<epoch>)`` to ``MockContext(clock=...)`` to freeze time
+  and ``clock.advance(seconds)`` to step it forward. Drives TTLs on
+  ``ctx.kv``, ``ctx.ephemeral.cooldown_*``, ``dedup``, and ``flag_*``.
+- **``_MockInteraction.respond()`` and ``.followup()`` accept ``allowed_mentions``**
+  — captured in ``ctx.interaction.responses[i]["allowed_mentions"]`` /
+  ``followups[i]["allowed_mentions"]`` so tests can assert on it. Matches the
+  real ``Context`` surface that's been there since 0.5.0.
+- **``_MockInteraction.followup()`` returns ``{message_id, channel_id}``** —
+  matches the 0.5.3 real-Context change (T2-E). ``channel_id`` is empty in the
+  mock (unknown without a live interaction); ``message_id`` is a synthetic
+  monotonic counter so tests can correlate followups.
+- **``_MockDiscord.edit_message()`` accepts ``components``** — captured in
+  ``ctx.discord.messages_edited[i]["components"]``. Matches the 0.5.3
+  real-Context change (T2-D).
+- **``_MockSecrets``** — in-memory mirror of ``ctx.secrets`` (was previously
+  only in the platform-bundled SDK copy; now part of the published package).
+  ``MockContext.secrets`` is set automatically.
+- **``MockContext.request_id``** property — mirrors the real ``Context.request_id``
+  added in 0.5.3 (T2-B).
+- ``storage:sql`` and ``storage:secrets`` added to the default capability set
+  on ``MockContext()`` so plugins using those don't need to pass
+  ``capabilities=[...]`` explicitly.
+
+### Notes
+
+- All testing-module additions are backwards-compatible — existing tests keep
+  working without changes. Adopt incrementally.
+- For deterministic TTL/cooldown tests, the migration is one line:
+  ``ctx = MockContext(clock=MockClock(start=1000.0))``. Then exercise paths
+  that read TTLs via ``ctx.clock.advance(seconds)``.
+
 ## [0.5.3] — 2026-05-17
 
 This release rolls up bug fixes and additive improvements driven by
