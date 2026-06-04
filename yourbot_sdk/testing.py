@@ -3,7 +3,7 @@ Testing utilities — test plugin handlers locally without Docker or the full pl
 
 Usage::
 
-    from mmo_maid_sdk.testing import MockContext, make_event
+    from yourbot_sdk.testing import MockContext, make_event
 
     def test_ping_handler():
         ctx = MockContext()
@@ -65,7 +65,7 @@ class MockClock:
 
 
 class _MockSecrets:
-    """In-memory plugin secrets store for testing (0.5.4+).
+    """In-memory plugin secrets store for testing.
 
     Mirrors the ctx.secrets API: get returns None for unset keys, set/delete
     operate per-server (the mock just uses a flat dict keyed by key name —
@@ -385,8 +385,6 @@ class _MockInteraction:
             "ephemeral": ephemeral, "allowed_mentions": allowed_mentions,
             "message_id": msg_id,
         })
-        # Match real Context: followup() returns {message_id, channel_id}
-        # (the channel_id is unknown in the mock — return empty string).
         return {"message_id": msg_id, "channel_id": ""}
 
     def send_modal(self, title: str, custom_id: str, fields=None) -> None:

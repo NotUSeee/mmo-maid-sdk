@@ -23,11 +23,11 @@ from ._context import Context
 
 class Plugin:
     """
-    The entry point for every MMO Maid plugin.
+    The entry point for every YourBot plugin.
 
     Basic usage::
 
-        from mmo_maid_sdk import Plugin, Context
+        from yourbot_sdk import Plugin, Context
 
         plugin = Plugin()
 

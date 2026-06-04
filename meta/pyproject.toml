@@ -1,0 +1,36 @@
+# Alias meta-package: keeps `pip install mmo-maid-sdk` working after the rename.
+#
+# This builds the LEGACY distribution name `mmo-maid-sdk` as a thin redirect that
+# depends on `yourbot-sdk` of the same version. It carries NO code of its own —
+# the `yourbot-sdk` wheel already ships the `mmo_maid_sdk` import-compat shim, so
+# installing this pulls `yourbot-sdk` and both `import yourbot_sdk` and the legacy
+# `import mmo_maid_sdk` resolve.
+#
+# Publish it to the EXISTING `mmo-maid-sdk` PyPI project, versioned in lockstep with
+# `yourbot-sdk` (same git tag drives both). See SDK_RELEASE.md.
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mmo-maid-sdk"
+version = "0.6.0"
+description = "Deprecated alias for yourbot-sdk. Installs the YourBot SDK."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = ["yourbot-sdk==0.6.0"]
+classifiers = [
+    "Development Status :: 7 - Inactive",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://yourbot.gg/dev"
+Repository = "https://github.com/NotUSeee/yourbot-sdk"
+
+# No packages — this distribution is purely an install-name redirect.
+[tool.setuptools]
+py-modules = []

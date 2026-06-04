@@ -1,12 +1,12 @@
-"""mmo-maid-sdk CLI — scaffold and locally test plugins.
+"""yourbot-sdk CLI — scaffold and locally test plugins.
 
 Two subcommands:
 
-  mmo new <plugin-id>   Scaffold a new plugin directory with __main__.py,
+  yourbot new <plugin-id>   Scaffold a new plugin directory with __main__.py,
                         manifest, README, .gitignore, requirements.txt,
                         events.yaml (sample test events), and tests/.
 
-  mmo dev               Run the plugin in the current directory against a
+  yourbot dev               Run the plugin in the current directory against a
                         local mock host. Auto-fires events from events.yaml
                         once on start, then watches for file changes and
                         reloads. Prints every action your plugin took
@@ -42,16 +42,17 @@ _TEMPLATE_MAIN_PY = '''\
 {underline}
 
 This is the entry point for your plugin. The SDK handles all communication
-with the MMO Maid runner automatically.
+with the YourBot runner automatically.
 
 Local development:
-    pip install -e ../mmo-maid-sdk        # if you cloned the SDK
-    pip install mmo-maid-sdk              # from PyPI
-    mmo dev                                # run against a mock host
+    pip install -e ../yourbot-sdk        # if you cloned the SDK
+    pip install yourbot-sdk              # from PyPI
+    yourbot dev                                # run against a mock host
 
-Docs: https://mmomaid.com/dev/docs
+Docs: https://yourbot.gg/dev/docs
 """
-from mmo_maid_sdk import Plugin, Context
+from yourbot_sdk import Plugin, Context
+from yourbot_sdk.events import MessageCreate
 
 plugin = Plugin()
 
@@ -63,8 +64,13 @@ def on_ready(ctx: Context):
 
 
 @plugin.on_event("message_create")
-def on_message(ctx: Context, event: dict):
-    """Reply to !ping with Pong!. Replace this with your own logic."""
+def on_message(ctx: Context, event: MessageCreate):
+    """Reply to !ping with Pong!. Replace this with your own logic.
+
+    The `MessageCreate` type hint gives you IDE autocomplete on the event
+    fields (event.content, event.channel_id, etc.). It's a TypedDict, so
+    you can still `event.get(...)` for safety.
+    """
     content = event.get("content", "")
     if content.strip() == "!ping":
         ctx.discord.send_message(
@@ -82,7 +88,7 @@ _TEMPLATE_MANIFEST_JSON = '''\
   "id": "{plugin_id}",
   "name": "{name}",
   "version": "0.1.0",
-  "description": "A new MMO Maid plugin.",
+  "description": "A new YourBot plugin.",
   "capabilities_required": [
     "discord:send_message",
     "events:message_content"
@@ -93,16 +99,16 @@ _TEMPLATE_MANIFEST_JSON = '''\
 _TEMPLATE_README_MD = '''\
 # {name}
 
-A plugin for [MMO Maid](https://mmomaid.com).
+A plugin for [YourBot](https://yourbot.gg).
 
 ## Quick start
 
 ```bash
-pip install mmo-maid-sdk
-mmo dev                # run locally against a mock host
+pip install yourbot-sdk
+yourbot dev                # run locally against a mock host
 ```
 
-Edit `__main__.py`, save, and `mmo dev` reloads automatically.
+Edit `__main__.py`, save, and `yourbot dev` reloads automatically.
 
 ## Capabilities
 
@@ -116,7 +122,7 @@ Update `manifest.json` and re-submit if you add or remove capabilities.
 ## Publishing
 
 1. Push this directory to a GitHub repo.
-2. In the [MMO Maid dev portal](https://mmomaid.com/dev), create a new plugin
+2. In the [YourBot dev portal](https://yourbot.gg/dev), create a new plugin
    and link the repo.
 3. Pull a version, confirm the auto-detected capabilities, and submit for review.
 '''
@@ -135,13 +141,13 @@ dist/
 '''
 
 _TEMPLATE_REQUIREMENTS = '''\
-mmo-maid-sdk>=0.5.0
+yourbot-sdk>=0.5.0
 '''
 
 _TEMPLATE_EVENTS_YAML = '''\
-# Test events for `mmo dev` to fire on start.
+# Test events for `yourbot dev` to fire on start.
 # Each entry is one event delivered to your plugin's matching @plugin.on_event handler.
-# `mmo dev` fires these top-to-bottom on launch and reload.
+# `yourbot dev` fires these top-to-bottom on launch and reload.
 
 - type: message_create
   channel_id: "111111111111111111"
@@ -160,7 +166,7 @@ _TEMPLATE_EVENTS_YAML = '''\
 
 _TEMPLATE_TEST_PY = '''\
 """Unit tests for the plugin handlers — run with: python -m pytest"""
-from mmo_maid_sdk.testing import MockContext, make_event
+from yourbot_sdk.testing import MockContext, make_event
 from plugin_main import on_message
 
 
@@ -190,7 +196,7 @@ _TEMPLATE_SLASH_MAIN = '''\
 A slash-command plugin starter. Registers `/hello` which replies with a
 personalised greeting. Extend by adding more @plugin.on_slash_command handlers.
 """
-from mmo_maid_sdk import Plugin, Context
+from yourbot_sdk import Plugin, Context
 
 plugin = Plugin()
 
@@ -215,7 +221,7 @@ _TEMPLATE_SLASH_MANIFEST = '''\
   "id": "{plugin_id}",
   "name": "{name}",
   "version": "0.1.0",
-  "description": "Slash-command starter for MMO Maid.",
+  "description": "Slash-command starter for YourBot.",
   "capabilities_required": [
     "interaction:respond"
   ],
@@ -241,7 +247,7 @@ _TEMPLATE_SLASH_EVENTS = '''\
 
 _TEMPLATE_SLASH_TEST = '''\
 """Tests for the /hello slash command."""
-from mmo_maid_sdk.testing import MockContext, make_event
+from yourbot_sdk.testing import MockContext, make_event
 from plugin_main import cmd_hello
 
 
@@ -271,13 +277,14 @@ per-server in plugin KV so different servers can configure different channels.
 To set the welcome channel for a server, an admin runs `/welcome-channel`
 inside that server (see the slash command below).
 """
-from mmo_maid_sdk import Plugin, Context
+from yourbot_sdk import Plugin, Context
+from yourbot_sdk.events import MemberJoin
 
 plugin = Plugin()
 
 
 @plugin.on_event("member_join")
-def on_member_join(ctx: Context, event: dict):
+def on_member_join(ctx: Context, event: MemberJoin):
     channel_id = ctx.kv.get("welcome_channel_id")
     if not channel_id:
         return  # admin hasn't configured a channel yet
@@ -346,7 +353,7 @@ _TEMPLATE_WELCOME_EVENTS = '''\
 
 _TEMPLATE_WELCOME_TEST = '''\
 """Tests for the welcome greeter."""
-from mmo_maid_sdk.testing import MockContext, make_event
+from yourbot_sdk.testing import MockContext, make_event
 from plugin_main import on_member_join, cmd_set_channel
 
 
@@ -382,7 +389,7 @@ configured channel and increments a counter every 15 minutes.
 Cron specs are 5-field standard: "minute hour day month dow", UTC.
 See SDK docs for the full syntax.
 """
-from mmo_maid_sdk import Plugin, Context
+from yourbot_sdk import Plugin, Context
 
 plugin = Plugin()
 
@@ -450,7 +457,7 @@ _TEMPLATE_CRON_MANIFEST = '''\
 '''
 
 _TEMPLATE_CRON_EVENTS = '''\
-# `mmo dev` does NOT fire cron tasks - they run on real wall-clock time.
+# `yourbot dev` does NOT fire cron tasks - they run on real wall-clock time.
 # This file lets you exercise the slash command in the local loop.
 
 - type: interaction_create
@@ -465,7 +472,7 @@ _TEMPLATE_CRON_EVENTS = '''\
 
 _TEMPLATE_CRON_TEST = '''\
 """Tests for the cron starter handlers."""
-from mmo_maid_sdk.testing import MockContext, make_event
+from yourbot_sdk.testing import MockContext, make_event
 from plugin_main import daily_summary, heartbeat
 
 
@@ -549,7 +556,7 @@ TEMPLATES: dict = {
 }
 
 
-# ── `mmo new` ──────────────────────────────────────────────────────────────
+# ── `yourbot new` ──────────────────────────────────────────────────────────────
 
 _PLUGIN_ID_RE = re.compile(r"^[a-z][a-z0-9_]{2,31}$")
 
@@ -562,7 +569,7 @@ def _print_template_catalog() -> None:
         summary = TEMPLATES[key]["summary"]
         print(f"  {key:<{width}}  {summary}")
     print()
-    print("Use:  mmo new <plugin_id> --template <name>")
+    print("Use:  yourbot new <plugin_id> --template <name>")
 
 
 def cmd_new(args: argparse.Namespace) -> int:
@@ -587,7 +594,7 @@ def cmd_new(args: argparse.Namespace) -> int:
     template_key = (getattr(args, "template", None) or "basic").strip().lower()
     if template_key not in TEMPLATES:
         print(
-            f"error: unknown template {template_key!r}. Run `mmo new --list-templates` to see options.",
+            f"error: unknown template {template_key!r}. Run `yourbot new --list-templates` to see options.",
             file=sys.stderr,
         )
         return 2
@@ -620,12 +627,160 @@ def cmd_new(args: argparse.Namespace) -> int:
     print("Next steps:")
     print(f"  cd {target.relative_to(Path.cwd()) if target.is_relative_to(Path.cwd()) else target}")
     print("  pip install -r requirements.txt")
-    print("  mmo dev                  # local test loop with hot-reload")
-    print("  python -m pytest         # unit tests via mmo_maid_sdk.testing")
+    print("  yourbot dev                  # local test loop with hot-reload")
+    print("  python -m pytest         # unit tests via yourbot_sdk.testing")
     return 0
 
 
-# ── `mmo dev` ──────────────────────────────────────────────────────────────
+# ── `yourbot init` (interactive wizard) ─────────────────────────────────────────
+
+
+def _prompt(prompt_text: str, *, default: str = "", required: bool = False) -> str:
+    """Prompt the user for input. Returns the trimmed answer or the default.
+
+    Re-prompts if the answer is empty and ``required`` is True.
+    """
+    while True:
+        suffix = f" [{default}]" if default else ""
+        try:
+            raw = input(f"{prompt_text}{suffix}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[yourbot init] cancelled.", file=sys.stderr)
+            sys.exit(1)
+        value = raw or default
+        if value or not required:
+            return value
+        print("  this value is required.")
+
+
+def _prompt_yes_no(prompt_text: str, *, default: bool = False) -> bool:
+    """Yes/no prompt; falls back to ``default`` on empty input."""
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        try:
+            raw = input(f"{prompt_text} {suffix}: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[yourbot init] cancelled.", file=sys.stderr)
+            sys.exit(1)
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("  please answer y or n.")
+
+
+def _prompt_template() -> str:
+    """Show the template catalog and prompt the user to pick one."""
+    keys = sorted(TEMPLATES.keys())
+    print()
+    print("Templates:")
+    width = max(len(k) for k in keys)
+    for i, k in enumerate(keys, start=1):
+        print(f"  {i}. {k:<{width}}  {TEMPLATES[k]['summary']}")
+    print()
+    while True:
+        choice = _prompt("Choose a template (number or name)", default="basic")
+        if choice in TEMPLATES:
+            return choice
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(keys):
+                return keys[idx]
+        print(f"  unknown template {choice!r}.")
+
+
+def _open_in_editor_if_possible(path: Path) -> bool:
+    """Try to open the scaffolded project in VS Code if it's installed.
+
+    Returns True if the editor was launched, False otherwise.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+    code_bin = _shutil.which("code")
+    if not code_bin:
+        return False
+    try:
+        # `code <path>` opens VS Code with that folder as the workspace.
+        # Run detached so it doesn't block our terminal.
+        if sys.platform == "win32":
+            _subprocess.Popen([code_bin, str(path)], creationflags=0x00000008)  # DETACHED_PROCESS
+        else:
+            _subprocess.Popen([code_bin, str(path)], start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Interactive wizard for starting a new plugin.
+
+    Equivalent to ``yourbot new`` with all flags prompted for. Designed for
+    people who just installed the SDK and want a first plugin scaffold
+    without learning the flag syntax.
+    """
+    print("[yourbot init] Let's create your first plugin.")
+    print()
+
+    # Plugin id — must match the platform regex. Default = sanitized cwd name.
+    cwd_name = Path.cwd().name.lower()
+    suggested_id = ""
+    if _PLUGIN_ID_RE.match(cwd_name):
+        suggested_id = cwd_name
+    while True:
+        plugin_id = _prompt(
+            "Plugin id (lowercase, 3-32 chars, letters/digits/underscores, starts with a letter)",
+            default=suggested_id,
+            required=True,
+        ).strip().lower()
+        if _PLUGIN_ID_RE.match(plugin_id):
+            break
+        print(f"  invalid plugin id {plugin_id!r}. Must be 3-32 chars, lowercase letters/digits/underscores, starts with a letter.")
+
+    # Template — defaults to basic; shows the catalog.
+    template_key = _prompt_template()
+
+    # Target directory — defaults to ./plugin_id, but allow current dir.
+    target_default = plugin_id
+    raw_target = _prompt("Target directory", default=target_default)
+    target = Path(raw_target).resolve()
+
+    if target.exists() and any(target.iterdir()):
+        print(f"error: target directory {target} is not empty.", file=sys.stderr)
+        return 2
+
+    # Optional: open in VS Code if available.
+    import shutil as _shutil
+    has_code = _shutil.which("code") is not None
+    open_editor = False
+    if has_code:
+        open_editor = _prompt_yes_no("Open in VS Code when done?", default=True)
+
+    # Delegate to cmd_new by constructing the equivalent argparse Namespace.
+    new_args = argparse.Namespace(
+        plugin_id=plugin_id,
+        template=template_key,
+        target=str(target),
+        list_templates=False,
+    )
+    rc = cmd_new(new_args)
+    if rc != 0:
+        return rc
+
+    if open_editor:
+        opened = _open_in_editor_if_possible(target)
+        if opened:
+            print()
+            print(f"[ok] opened {target} in VS Code")
+        else:
+            print()
+            print(f"[note] couldn't launch VS Code automatically. Open {target} manually.")
+
+    return 0
+
+
+# ── `yourbot dev` ──────────────────────────────────────────────────────────────
 
 def _load_plugin_module(plugin_dir: Path) -> Any:
     """Import the plugin's __main__.py and return the loaded module.
@@ -770,14 +925,14 @@ def cmd_dev(args: argparse.Namespace) -> int:
     plugin_dir = Path(args.path or ".").resolve()
     if not (plugin_dir / "__main__.py").exists():
         print(f"error: no __main__.py in {plugin_dir}.", file=sys.stderr)
-        print("       run `mmo new <plugin-id>` to scaffold a new plugin.", file=sys.stderr)
+        print("       run `yourbot new <plugin-id>` to scaffold a new plugin.", file=sys.stderr)
         return 2
 
-    # Make `from mmo_maid_sdk.testing import MockContext` work
-    from mmo_maid_sdk.testing import MockContext, make_event
+    # Make `from yourbot_sdk.testing import MockContext` work
+    from yourbot_sdk.testing import MockContext, make_event
 
     def fire_all() -> None:
-        print(f"\n[mmo dev] loading {plugin_dir / '__main__.py'}")
+        print(f"\n[yourbot dev] loading {plugin_dir / '__main__.py'}")
         try:
             mod = _load_plugin_module(plugin_dir)
         except Exception as exc:
@@ -831,10 +986,10 @@ def cmd_dev(args: argparse.Namespace) -> int:
     fire_all()
 
     if not args.watch:
-        print("\n[mmo dev] done. add --watch to reload on file changes.")
+        print("\n[yourbot dev] done. add --watch to reload on file changes.")
         return 0
 
-    print(f"\n[mmo dev] watching {plugin_dir} (Ctrl+C to stop)…")
+    print(f"\n[yourbot dev] watching {plugin_dir} (Ctrl+C to stop)…")
     last_sig = _file_signature(plugin_dir)
     try:
         while True:
@@ -842,10 +997,10 @@ def cmd_dev(args: argparse.Namespace) -> int:
             sig = _file_signature(plugin_dir)
             if sig != last_sig:
                 last_sig = sig
-                print("\n[mmo dev] change detected — reloading…")
+                print("\n[yourbot dev] change detected — reloading…")
                 fire_all()
     except KeyboardInterrupt:
-        print("\n[mmo dev] stopped.")
+        print("\n[yourbot dev] stopped.")
         return 0
 
 
@@ -864,22 +1019,391 @@ def _resolve_event_handlers(plugin_obj: Any, event_type: str) -> list:
     return []
 
 
+# ── validate ────────────────────────────────────────────────────────────────
+
+# Paths to exclude when zipping a plugin directory for validation. Mirrors the
+# server-side artifact_store behavior so what `yourbot validate` checks is what
+# the platform will check.
+_VALIDATE_EXCLUDE_DIRS = {
+    ".git", ".github", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", "node_modules", "dist", "build", "tests", "test",
+}
+_VALIDATE_EXCLUDE_NAMES = {".DS_Store", "Thumbs.db"}
+_VALIDATE_EXCLUDE_SUFFIXES = (".pyc", ".pyo")
+
+
+def _zip_plugin_dir(plugin_dir: Path) -> bytes:
+    """Zip a plugin directory in-memory, excluding dev junk. Returns zip bytes."""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(plugin_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(plugin_dir)
+            parts = rel.parts
+            if any(p in _VALIDATE_EXCLUDE_DIRS for p in parts):
+                continue
+            if rel.name in _VALIDATE_EXCLUDE_NAMES:
+                continue
+            if rel.suffix in _VALIDATE_EXCLUDE_SUFFIXES:
+                continue
+            try:
+                zf.write(path, rel.as_posix())
+            except OSError:
+                continue
+    return buf.getvalue()
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    """Run the same pre-submit validation the platform runs, locally.
+
+    Mirrors what `dev_version_submit_for_review` does on the server side.
+    Exits 0 if clean, 1 if any errors, 2 if the directory looks wrong.
+    Warnings never fail the command — only errors do.
+    """
+    plugin_dir = Path(args.path or ".").resolve()
+    if not plugin_dir.is_dir():
+        print(f"error: {plugin_dir} is not a directory.", file=sys.stderr)
+        return 2
+    if not (plugin_dir / "__main__.py").exists():
+        print(f"error: no __main__.py in {plugin_dir}.", file=sys.stderr)
+        print("       run `yourbot new <plugin-id>` to scaffold a new plugin, or use --path.", file=sys.stderr)
+        return 2
+
+    # Read manifest.json to default the plugin_id/version to whatever is in it
+    # — the validator will catch mismatches between that and platform values.
+    manifest_path = plugin_dir / "manifest.json"
+    manifest_plugin_id = ""
+    manifest_version = ""
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                _m = json.load(fh)
+            if isinstance(_m, dict):
+                manifest_plugin_id = str(_m.get("id") or "").strip()
+                manifest_version = str(_m.get("version") or "").strip()
+        except Exception:
+            # The validator will surface a useful "manifest invalid" error
+            # — don't fail here.
+            pass
+
+    plugin_id = args.id or manifest_plugin_id or plugin_dir.name
+    version = args.version or manifest_version or "0.0.0"
+
+    # Zip the directory in-memory and run the validator.
+    try:
+        artifact_bytes = _zip_plugin_dir(plugin_dir)
+    except Exception as exc:
+        print(f"error: failed to zip {plugin_dir}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    from ._validation import validate_artifact
+    result = validate_artifact(
+        plugin_id=plugin_id,
+        version=version,
+        artifact_bytes=artifact_bytes,
+    )
+
+    # Format findings — mimics how the platform displays them on the version row.
+    errors = result.errors
+    warnings = result.warnings
+
+    def _fmt(f) -> str:
+        loc = f"{f.path}:{f.line}" if (f.path and f.line) else (f.path or "")
+        prefix = f"[{loc}] " if loc else ""
+        body = f"  • {prefix}{f.message}"
+        if f.hint:
+            body += f"\n      hint: {f.hint}"
+        return body
+
+    if errors:
+        print(f"\n{len(errors)} error(s):", file=sys.stderr)
+        for f in errors:
+            print(_fmt(f), file=sys.stderr)
+    if warnings:
+        print(f"\n{len(warnings)} warning(s):", file=sys.stderr)
+        for f in warnings:
+            print(_fmt(f), file=sys.stderr)
+
+    if errors:
+        print(f"\nFAILED: {len(errors)} error(s), {len(warnings)} warning(s). "
+              f"Fix the errors and re-run.", file=sys.stderr)
+        return 1
+
+    if warnings:
+        print(f"\nOK with {len(warnings)} warning(s). "
+              f"Warnings don't block submission but should be fixed.", file=sys.stderr)
+    else:
+        print(f"\nOK — no issues found in {plugin_dir}.", file=sys.stderr)
+    return 0
+
+
+# ── yourbot doctor ──────────────────────────────────────────────────────────────
+
+
+_DoctorCheck = tuple  # (status: 'ok' | 'warn' | 'error', short_label: str, detail: str | None)
+
+
+def _doctor_status_glyph(status: str) -> str:
+    return {"ok": "[OK]", "warn": "[!!]", "error": "[XX]"}.get(status, "[??]")
+
+
+def _doctor_check_sdk_install() -> _DoctorCheck:
+    """Is the SDK importable and is it a recognized version?"""
+    try:
+        import yourbot_sdk
+        version = getattr(yourbot_sdk, "__version__", "unknown")
+        return ("ok", "SDK installed", f"version {version}")
+    except Exception as exc:
+        return ("error", "SDK import failed",
+                f"{type(exc).__name__}: {exc}. Run: pip install yourbot-sdk")
+
+
+def _doctor_check_main_py(plugin_dir: Path) -> _DoctorCheck:
+    """Does __main__.py exist and parse as valid Python?"""
+    main_py = plugin_dir / "__main__.py"
+    if not main_py.exists():
+        return ("error", "__main__.py missing",
+                f"Expected {main_py}. Run `yourbot new <plugin_id>` to scaffold.")
+    try:
+        import ast
+        with open(main_py, "r", encoding="utf-8") as fh:
+            data = fh.read()
+        ast.parse(data, filename=str(main_py))
+        return ("ok", "__main__.py parses", f"{len(data)} bytes")
+    except SyntaxError as exc:
+        return ("error", "__main__.py has SyntaxError",
+                f"{exc.msg} at line {exc.lineno}. Fix the syntax before deploying.")
+    except Exception as exc:
+        return ("error", "__main__.py unreadable", f"{type(exc).__name__}: {exc}")
+
+
+def _doctor_check_manifest(plugin_dir: Path) -> _DoctorCheck:
+    """Does manifest.json exist and have the required fields?"""
+    manifest_path = plugin_dir / "manifest.json"
+    if not manifest_path.exists():
+        return ("error", "manifest.json missing",
+                f"Expected {manifest_path}. Required fields: id, name, version.")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            m = json.load(fh)
+    except json.JSONDecodeError as exc:
+        return ("error", "manifest.json invalid JSON",
+                f"{exc.msg} at line {exc.lineno}.")
+    except Exception as exc:
+        return ("error", "manifest.json unreadable", f"{type(exc).__name__}: {exc}")
+    missing = [f for f in ("id", "name", "version") if not str(m.get(f) or "").strip()]
+    if missing:
+        return ("error", "manifest.json missing fields",
+                f"Required: {', '.join(missing)}")
+    return ("ok", "manifest.json valid",
+            f"id={m.get('id')!r}, version={m.get('version')!r}")
+
+
+def _doctor_check_capabilities(plugin_dir: Path) -> _DoctorCheck:
+    """Are declared and detected capabilities consistent?"""
+    main_py = plugin_dir / "__main__.py"
+    manifest_path = plugin_dir / "manifest.json"
+    if not main_py.exists() or not manifest_path.exists():
+        return ("warn", "capabilities skipped", "needs __main__.py + manifest.json")
+    try:
+        from ._validation import _detect_capabilities, manifest_capabilities
+        with open(main_py, "rb") as fh:
+            src = fh.read()
+        # Also scan other .py files at root
+        sources = [src]
+        for p in plugin_dir.glob("*.py"):
+            if p.name == "__main__.py":
+                continue
+            try:
+                with open(p, "rb") as fh:
+                    sources.append(fh.read())
+            except OSError:
+                continue
+        detected = set(_detect_capabilities(sources))
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        declared = set(manifest_capabilities(manifest))
+        missing_in_manifest = detected - declared
+        if missing_in_manifest:
+            # The platform auto-adds these on upload, but a local heads-up is friendlier.
+            return ("warn", "Some used caps not declared in manifest.json",
+                    f"Detected {sorted(missing_in_manifest)} — the platform will auto-add these, but declaring upfront is cleaner.")
+        unused = declared - detected - {"storage:kv", "storage:sql", "interaction:respond"}
+        if unused:
+            return ("warn", "Some declared caps appear unused",
+                    f"Unused: {sorted(unused)}. Customers prefer plugins that ask for fewer permissions.")
+        return ("ok", "Capabilities consistent",
+                f"{len(declared)} declared, all match detected usage")
+    except Exception as exc:
+        return ("warn", "Capability check failed", f"{type(exc).__name__}: {exc}")
+
+
+def _doctor_check_tests(plugin_dir: Path) -> _DoctorCheck:
+    """Is there a tests/ directory with at least one test file?"""
+    tests_dir = plugin_dir / "tests"
+    if not tests_dir.is_dir():
+        return ("warn", "No tests/ directory",
+                "Add tests/test_plugin.py with MockContext. `yourbot new` scaffolds this.")
+    test_files = list(tests_dir.glob("test_*.py")) + list(tests_dir.glob("*_test.py"))
+    if not test_files:
+        return ("warn", "tests/ has no test files",
+                "Tests should be named test_*.py or *_test.py for pytest to collect.")
+    return ("ok", f"{len(test_files)} test file(s)",
+            ", ".join(p.name for p in test_files[:3])
+            + (f" (+{len(test_files) - 3} more)" if len(test_files) > 3 else ""))
+
+
+def _doctor_check_requirements(plugin_dir: Path) -> _DoctorCheck:
+    """Does requirements.txt include yourbot-sdk?"""
+    req_path = plugin_dir / "requirements.txt"
+    if not req_path.exists():
+        return ("warn", "requirements.txt missing",
+                "Add `yourbot-sdk` so deploys install the SDK.")
+    try:
+        content = req_path.read_text(encoding="utf-8").lower()
+    except OSError:
+        return ("warn", "requirements.txt unreadable", "")
+    # Accept the legacy mmo-maid-sdk / mmo_maid_sdk names too — older plugins
+    # pin the pre-rename package and the platform still resolves it via the alias.
+    if not any(s in content for s in ("yourbot-sdk", "yourbot_sdk", "mmo-maid-sdk", "mmo_maid_sdk")):
+        return ("warn", "yourbot-sdk not in requirements.txt",
+                "Add it so plugin runtime installs the SDK.")
+    return ("ok", "requirements.txt OK", "yourbot-sdk pinned")
+
+
+def _doctor_check_git_ignore(plugin_dir: Path) -> _DoctorCheck:
+    """Is .gitignore sane? Catches __pycache__/.venv/etc."""
+    gi = plugin_dir / ".gitignore"
+    expected_lines = ("__pycache__", "*.pyc", ".venv", "venv")
+    if not gi.exists():
+        return ("warn", ".gitignore missing",
+                "Recommended: ignore __pycache__/, *.pyc, .venv/, venv/.")
+    try:
+        content = gi.read_text(encoding="utf-8")
+    except OSError:
+        return ("warn", ".gitignore unreadable", "")
+    missing = [pat for pat in expected_lines if pat not in content]
+    if missing:
+        return ("warn", ".gitignore missing common entries",
+                f"Consider adding: {', '.join(missing)}")
+    return ("ok", ".gitignore OK", "common patterns present")
+
+
+def _doctor_check_dangerous_imports(plugin_dir: Path) -> _DoctorCheck:
+    """Catch sandbox-forbidden imports locally so the dev doesn't hit them at deploy."""
+    forbidden = {"subprocess", "ctypes", "socket", "multiprocessing"}
+    py_files = list(plugin_dir.glob("**/*.py"))
+    hits: list[tuple[str, int, str]] = []
+    for p in py_files:
+        parts = p.parts
+        if any(part in (".venv", "venv", "tests", "test", "__pycache__") for part in parts):
+            continue
+        try:
+            data = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for i, line in enumerate(data.splitlines(), start=1):
+            stripped = line.lstrip()
+            for mod in forbidden:
+                if (stripped == f"import {mod}"
+                        or stripped.startswith(f"import {mod} ")
+                        or stripped.startswith(f"import {mod}.")
+                        or stripped.startswith(f"from {mod} ")):
+                    hits.append((str(p.relative_to(plugin_dir)), i, mod))
+                    break
+    if hits:
+        sample = "; ".join(f"{path}:{lineno} ({mod})" for path, lineno, mod in hits[:3])
+        more = f" (+{len(hits) - 3} more)" if len(hits) > 3 else ""
+        return ("error", "Sandbox-forbidden imports detected",
+                f"{sample}{more}. Remove these — they'll be blocked at runtime.")
+    return ("ok", "No forbidden imports",
+            f"Scanned {len(py_files)} .py file{'s' if len(py_files) != 1 else ''}")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Run a battery of pre-flight checks against a plugin directory.
+
+    Exits 0 if no errors found (warnings allowed), 1 if any error, 2 if the
+    directory itself is wrong. Useful before pushing to GitHub or zipping for
+    upload — catches the common preventable mistakes locally.
+    """
+    plugin_dir = Path(args.path or ".").resolve()
+    if not plugin_dir.is_dir():
+        print(f"error: {plugin_dir} is not a directory.", file=sys.stderr)
+        return 2
+
+    print(f"[yourbot doctor] checking {plugin_dir}\n")
+
+    checks = [
+        ("SDK install",          lambda: _doctor_check_sdk_install()),
+        ("__main__.py",          lambda: _doctor_check_main_py(plugin_dir)),
+        ("manifest.json",        lambda: _doctor_check_manifest(plugin_dir)),
+        ("capabilities",         lambda: _doctor_check_capabilities(plugin_dir)),
+        ("forbidden imports",    lambda: _doctor_check_dangerous_imports(plugin_dir)),
+        ("requirements.txt",     lambda: _doctor_check_requirements(plugin_dir)),
+        ("tests/",               lambda: _doctor_check_tests(plugin_dir)),
+        (".gitignore",           lambda: _doctor_check_git_ignore(plugin_dir)),
+    ]
+
+    err_count = 0
+    warn_count = 0
+
+    name_col = max(len(name) for name, _ in checks)
+    for name, runner in checks:
+        try:
+            status, label, detail = runner()
+        except Exception as exc:
+            status, label, detail = "error", "check crashed", f"{type(exc).__name__}: {exc}"
+        if status == "error":
+            err_count += 1
+        elif status == "warn":
+            warn_count += 1
+        glyph = _doctor_status_glyph(status)
+        print(f"  {glyph} {name:<{name_col}}  {label}")
+        if detail:
+            print(f"        {detail}")
+
+    print()
+    if err_count:
+        print(f"FAILED: {err_count} error(s), {warn_count} warning(s). Fix the errors.",
+              file=sys.stderr)
+        return 1
+    if warn_count:
+        print(f"OK with {warn_count} warning(s). Warnings don't block deployment but should be cleaned up.")
+    else:
+        print("OK — all checks pass.")
+    return 0
+
+
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="mmo",
-        description="MMO Maid plugin development CLI",
+        prog="yourbot",
+        description="YourBot plugin development CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
-              mmo new my_plugin              # scaffold a new plugin in ./my_plugin
-              mmo new my_plugin --target .   # scaffold into the current directory
-              mmo dev                         # run plugin in cwd against mock host
-              mmo dev --watch                 # also reload on file changes
+              yourbot init                        # interactive wizard for first-time setup
+              yourbot new my_plugin              # scaffold a new plugin in ./my_plugin
+              yourbot new my_plugin --target .   # scaffold into the current directory
+              yourbot dev                         # run plugin in cwd against mock host
+              yourbot dev --watch                 # also reload on file changes
+              yourbot validate                    # run the platform's pre-submit checks locally
+              yourbot validate --id my_plugin     # validate against a specific plugin_id
+              yourbot doctor                      # pre-flight: SDK install + manifest + caps + tests + env
         """),
     )
     sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
+
+    p_init = sub.add_parser(
+        "init",
+        help="interactive wizard for first-time plugin setup (prompts instead of flags)",
+    )
+    p_init.set_defaults(func=cmd_init)
 
     p_new = sub.add_parser("new", help="scaffold a new plugin directory")
     p_new.add_argument("plugin_id", nargs="?", default=None,
@@ -889,7 +1413,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_new.add_argument("--template", default="basic",
                        choices=sorted(TEMPLATES.keys()),
                        help="starter template (default: basic). "
-                            "Run `mmo new --list-templates` to see what each one does.")
+                            "Run `yourbot new --list-templates` to see what each one does.")
     p_new.add_argument("--list-templates", action="store_true",
                        help="print the catalog of available templates and exit")
     p_new.set_defaults(func=cmd_new)
@@ -900,6 +1424,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_dev.add_argument("--watch", "-w", action="store_true",
                        help="reload on file changes")
     p_dev.set_defaults(func=cmd_dev)
+
+    p_validate = sub.add_parser(
+        "validate",
+        help="run pre-submit checks locally (the same ones the platform runs)",
+    )
+    p_validate.add_argument("--path", "-p", default=None,
+                            help="plugin directory (default: cwd)")
+    p_validate.add_argument("--id", default=None,
+                            help="override the plugin_id for the cap-mismatch check "
+                                 "(default: read from manifest.json, then directory name)")
+    p_validate.add_argument("--version", default=None,
+                            help="override the version for the version-mismatch check "
+                                 "(default: read from manifest.json)")
+    p_validate.set_defaults(func=cmd_validate)
+
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="pre-flight diagnostic: SDK install, manifest, capabilities, tests, env",
+    )
+    p_doctor.add_argument("--path", "-p", default=None,
+                          help="plugin directory (default: cwd)")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     return p
 

@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-and-publish:
-    name: Build and publish to PyPI
+    name: Build and publish yourbot-sdk (+ mmo-maid-sdk alias)
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -23,16 +23,37 @@ jobs:
           python-version: '3.12'
 
       - name: Install build tooling
-        run: python -m pip install --upgrade pip build
+        run: python -m pip install --upgrade pip build twine
 
-      - name: Build sdist and wheel
-        run: python -m build
+      # ── Primary package: yourbot-sdk ────────────────────────────────────────
+      # Ships BOTH the real `yourbot_sdk` package and the `mmo_maid_sdk` import
+      # compat shim (see pyproject [tool.setuptools.packages.find]).
+      - name: Build yourbot-sdk
+        run: python -m build --outdir dist .
 
-      - name: Verify built distributions
+      - name: Verify yourbot-sdk
         run: |
-          python -m pip install --upgrade twine
           python -m twine check dist/*
           ls -la dist/
 
-      - name: Publish to PyPI via Trusted Publisher
+      - name: Publish yourbot-sdk to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+      # ── Alias meta-package: mmo-maid-sdk ────────────────────────────────────
+      # No code — just depends on yourbot-sdk of the same version so legacy
+      # `pip install mmo-maid-sdk` keeps resolving. Published to the existing
+      # mmo-maid-sdk PyPI project (which must trust this repo/workflow/env).
+      - name: Build mmo-maid-sdk alias
+        run: python -m build --outdir dist-meta meta
+
+      - name: Verify mmo-maid-sdk alias
+        run: |
+          python -m twine check dist-meta/*
+          ls -la dist-meta/
+
+      - name: Publish mmo-maid-sdk alias to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-meta

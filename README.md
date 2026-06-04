@@ -1,8 +1,8 @@
-# MMO Maid SDK
+# YourBot SDK
 
-SDK for building plugins for the [MMO Maid](https://mmomaid.com) Discord bot platform.
+SDK for building plugins for the [YourBot](https://yourbot.gg) Discord bot platform.
 
-MMO Maid runs marketplace plugins in sandboxed Docker containers. This SDK is the
+YourBot runs marketplace plugins in sandboxed Docker containers. This SDK is the
 official Python interface plugins use to receive Discord events, call the Discord
 API, store data, render dashboards, and emit metrics — all routed through the
 platform so plugins never need direct network access or credentials.
@@ -10,7 +10,7 @@ platform so plugins never need direct network access or credentials.
 ## Install
 
 ```bash
-pip install mmo-maid-sdk
+pip install yourbot-sdk
 ```
 
 Python 3.10 or newer.
@@ -18,7 +18,7 @@ Python 3.10 or newer.
 ## Hello, plugin
 
 ```python
-from mmo_maid_sdk import Plugin, Context
+from yourbot_sdk import Plugin, Context
 
 plugin = Plugin()
 
@@ -34,23 +34,23 @@ plugin.run()  # must be the last line
 ```
 
 Drop this in a folder named `my_plugin/` as `__main__.py`, zip it, and upload it
-via the [Developer Portal](https://mmomaid.com/dev).
+via the [Developer Portal](https://yourbot.gg/dev).
 
 ## CLI
 
-The package installs an `mmo` command for scaffolding and a local dev loop:
+The package installs a `yourbot` command for scaffolding and a local dev loop:
 
 ```bash
-mmo new my_plugin     # scaffold a new plugin from the template
-mmo dev               # run your plugin locally against a mock host
+yourbot new my_plugin     # scaffold a new plugin from the template
+yourbot dev               # run your plugin locally against a mock host
 ```
 
 ## Documentation
 
 Full plugin contract, capability reference, and publishing guide:
 
-- **Docs:** https://mmomaid.com/dev/docs
-- **Developer Portal:** https://mmomaid.com/dev
+- **Docs:** https://yourbot.gg/dev/docs
+- **Developer Portal:** https://yourbot.gg/dev
 
 ## License
 

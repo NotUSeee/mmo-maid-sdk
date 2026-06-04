@@ -6,7 +6,7 @@ Used with ``ctx.interaction.respond(components=[...])`` or
 
 Usage::
 
-    from mmo_maid_sdk import ActionRow, Button, SelectMenu, TextInput
+    from yourbot_sdk import ActionRow, Button, SelectMenu, TextInput
 
     # Buttons in a row
     row = ActionRow(
