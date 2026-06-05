@@ -162,7 +162,18 @@ class Transport:
             err = err or "unknown error"
             err_lower = err.lower()
             if "capability" in err_lower:
-                raise CapabilityError(err)
+                # Append an actionable hint pointing at the manifest, since this
+                # is the most common first-run failure.
+                hint = "" if "manifest" in err_lower else (
+                    " (add the capability to capabilities_required in your manifest.json)"
+                )
+                raise CapabilityError(err + hint)
+            # KV-quota must be checked before the generic quota branch: the host
+            # message "plugin_kv quota exceeded" also contains "quota exceeded",
+            # so the generic branch would otherwise mask KvQuotaError.
+            if "kv quota" in err_lower or "plugin_kv quota" in err_lower:
+                from ._exceptions import KvQuotaError
+                raise KvQuotaError(err)
             if "quota exceeded" in err_lower or "rate limit" in err_lower:
                 from ._exceptions import RateLimitError
                 # M4: Parse retry_after from "remaining=X.X/min" in error message
@@ -172,7 +183,8 @@ class Transport:
                 if _m:
                     remaining = float(_m.group(1))
                     _retry = 60 if remaining <= 0 else max(1, int(60 / max(remaining, 1)))
-                raise RateLimitError(err, retry_after=_retry)
+                _code = "QUOTA_EXCEEDED" if "quota exceeded" in err_lower else "RATE_LIMITED"
+                raise RateLimitError(err, retry_after=_retry, code=_code)
             if "discord api error" in err_lower:
                 from ._exceptions import DiscordApiError
                 import re as _re
@@ -184,9 +196,6 @@ class Transport:
             if ("bot lacks" in err_lower) or ("missing permission" in err_lower) or ("lacks permission" in err_lower):
                 from ._exceptions import SdkPermissionError
                 raise SdkPermissionError(err)
-            if "kv quota" in err_lower or "plugin_kv quota" in err_lower:
-                from ._exceptions import KvQuotaError
-                raise KvQuotaError(err)
             if "required" in err_lower and ("must be" in err_lower or "invalid" in err_lower):
                 from ._exceptions import ValidationError
                 raise ValidationError(err)

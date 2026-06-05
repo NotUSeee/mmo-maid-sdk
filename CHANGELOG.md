@@ -3,6 +3,52 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.6.1]
+
+### Added
+
+- **PEP 561 typing marker.** The wheel now ships `py.typed`, so type checkers
+  (mypy, pyright) and IDEs pick up the SDK's inline type hints when it's installed
+  from PyPI — previously the hints were ignored for installed (non-editable) users.
+- **`MockContext` enforces capabilities by default.** Calling a gated method
+  (e.g. `ctx.discord.send_message`) without the matching capability now raises
+  `CapabilityError`, matching production — so a passing test means a working
+  manifest. Pass `MockContext(strict_capabilities=False)` for the old behaviour.
+  (`MockContext(capabilities=[])` now means "no capabilities" rather than "all".)
+- **Typed Discord responses.** New `yourbot_sdk.responses` module with `Member`,
+  `Role`, `Channel`, `Guild`, and `Message` TypedDicts; the `ctx.discord` read
+  methods (`get_member`, `get_channel`, `get_guild`, `list_roles`,
+  `list_channels`, `list_members`, `search_members`, `get_messages`) are now
+  annotated with them for IDE autocomplete.
+- **`ctx.discord.iter_messages(...)`** — a generator that pages through a
+  channel's full history automatically (walks newest→oldest by default, or
+  oldest→newest with `after=`), so you no longer manage `before`/`after` cursors
+  by hand. The testing harness supports it via `ctx.discord.set_messages([...])`.
+- **Machine-readable error codes.** Every SDK exception now carries a stable
+  `.code` (e.g. `CAPABILITY_DENIED`, `RATE_LIMITED`, `QUOTA_EXCEEDED`,
+  `DISCORD_API_ERROR`, `BOT_MISSING_PERMISSION`, `KV_QUOTA_EXCEEDED`,
+  `VALIDATION_ERROR`, `RPC_TIMEOUT`) so you can branch on failures without
+  string-matching. `CapabilityError` messages now include a manifest hint.
+
+### Fixed
+
+- KV-quota errors now raise `KvQuotaError` (code `KV_QUOTA_EXCEEDED`) instead of
+  being misclassified as a generic `RateLimitError`.
+
+### Fixed — testing harness fidelity
+
+- `MockContext.kv.increment` now takes the keyword-only `path` argument, matching
+  the real API (JSON-object increments). `ctx.kv.increment("k", 5)` becomes
+  `ctx.kv.increment("k", amount=5)`.
+- `ctx.ephemeral.counter` in the mock is now a real sliding-window counter (it was
+  monotonic and never reset, making rate-limit tests false-pass).
+- The HTTP mock now records the `params` query-string argument; the SQL mock
+  `query` accepts `limit`; `metrics.query` accepts `aggregate` — all matching the
+  real signatures.
+- `yourbot dev` now reports log lines and KV writes (it read attributes that
+  didn't exist on `MockContext`, so those counters were always zero). `MockContext`
+  gained `kv_writes` and `log_lines` accessors.
+
 ## [0.6.0]
 
 ### Changed — package rename (`mmo-maid-sdk` → `yourbot-sdk`)

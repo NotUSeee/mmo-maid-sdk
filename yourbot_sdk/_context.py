@@ -43,10 +43,11 @@ Every handler gets a Context that exposes:
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ._transport import Transport
+    from .responses import Member, Role, Channel, Guild, Message
 
 
 class _SecretsApi:
@@ -326,7 +327,7 @@ class _DiscordApi:
             "emoji": str(emoji),
         })
 
-    def get_member(self, *, user_id: str) -> Dict[str, Any]:
+    def get_member(self, *, user_id: str) -> "Member":
         """Look up a server member.  Requires capability: discord:read
 
         Returns: user_id, username, display_name, nick, avatar, roles, joined_at, bot.
@@ -336,7 +337,7 @@ class _DiscordApi:
             return result.get("member") or {}
         return {}
 
-    def get_channel(self, *, channel_id: str) -> Dict[str, Any]:
+    def get_channel(self, *, channel_id: str) -> "Channel":
         """Look up a channel.  Requires capability: discord:read
 
         Returns: id, name, type, topic, parent_id, position, nsfw.
@@ -346,7 +347,7 @@ class _DiscordApi:
             return result.get("channel") or {}
         return {}
 
-    def list_roles(self) -> List[Dict[str, Any]]:
+    def list_roles(self) -> "List[Role]":
         """List all server roles.  Requires capability: discord:read
 
         Returns list of: id, name, color, position, managed, mentionable.
@@ -362,7 +363,7 @@ class _DiscordApi:
         role_id: Optional[str] = None,
         limit: int = 100,
         after: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> "List[Member]":
         """Paginated member listing. Requires capability: discord:read
 
         Args:
@@ -382,7 +383,7 @@ class _DiscordApi:
             return result.get("members") or []
         return []
 
-    def search_members(self, query: str, *, limit: int = 25) -> List[Dict[str, Any]]:
+    def search_members(self, query: str, *, limit: int = 25) -> "List[Member]":
         """Search members by username or nickname. Requires capability: discord:read
 
         Args:
@@ -406,7 +407,7 @@ class _DiscordApi:
         limit: int = 50,
         before: Optional[str] = None,
         after: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> "List[Message]":
         """Fetch message history from a channel. Requires capability: discord:read
 
         Args:
@@ -430,6 +431,57 @@ class _DiscordApi:
         if isinstance(result, dict):
             return result.get("messages") or []
         return []
+
+    def iter_messages(
+        self,
+        *,
+        channel_id: str,
+        batch_size: int = 50,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
+    ) -> "Iterator[Message]":
+        """Walk a channel's full message history, paging automatically.
+
+        ``get_messages`` returns at most 50 messages per call; this generator
+        keeps fetching pages and yields one message at a time so you can audit
+        or export an entire channel without managing cursors yourself.
+        Requires capability: discord:read.
+
+        Direction:
+          * default / ``before`` — walk newest → oldest (optionally starting
+            before a given message id).
+          * ``after`` — walk oldest → newest, starting after a given message id.
+
+        Args:
+            channel_id: The channel to walk.
+            batch_size: Messages per underlying fetch (1-50, default 50).
+            before: Start before this message id (newest→oldest walk).
+            after: Start after this message id (oldest→newest walk).
+
+        Yields:
+            One message dict at a time (see ``get_messages`` for the shape).
+        """
+        batch_size = min(max(1, int(batch_size)), 50)
+        forward = after is not None
+        cursor: Optional[str] = str(after) if forward else (str(before) if before is not None else None)
+        while True:
+            kwargs: Dict[str, Any] = {"channel_id": channel_id, "limit": batch_size}
+            if cursor is not None:
+                kwargs["after" if forward else "before"] = cursor
+            batch = self.get_messages(**kwargs)
+            if not batch:
+                return
+            for msg in batch:
+                yield msg
+            ids = [int(m["id"]) for m in batch if str(m.get("id", "")).isdigit()]
+            if not ids:
+                return
+            # Snowflake ids are monotonic, so compute the next cursor explicitly
+            # rather than trusting intra-batch ordering.
+            next_cursor = str(max(ids)) if forward else str(min(ids))
+            if next_cursor == cursor or len(batch) < batch_size:
+                return
+            cursor = next_cursor
 
     # ── Channel management (Phase 2) ──────────────────────────────────
 
@@ -703,7 +755,7 @@ class _DiscordApi:
 
     # ── Guild info ──────────────────────────────────────────────────────
 
-    def get_guild(self) -> Dict[str, Any]:
+    def get_guild(self) -> "Guild":
         """Get server info. Requires capability: discord:read
 
         Returns: id, name, icon, member_count, premium_tier, features, owner_id, description.
@@ -713,7 +765,7 @@ class _DiscordApi:
             return result.get("guild") or {}
         return {}
 
-    def list_channels(self) -> List[Dict[str, Any]]:
+    def list_channels(self) -> "List[Channel]":
         """List all channels in the server. Requires capability: discord:read
 
         Returns list of: id, name, type, parent_id, position.

@@ -23,6 +23,8 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from ._exceptions import CapabilityError
+
 
 class MockClock:
     """Clock abstraction for deterministic time-dependent tests (0.5.4+).
@@ -99,6 +101,9 @@ class _MockKv:
         self._store: Dict[str, Any] = {}
         self._ttls: Dict[str, float] = {}  # key -> expiry timestamp
         self._clock = clock or MockClock()
+        # Records every mutating call so tests (and `yourbot dev`) can report
+        # what the handler wrote. Each entry: {"op", "key", ...}.
+        self.writes: List[Dict[str, Any]] = []
 
     def _is_expired(self, key: str) -> bool:
         if key in self._ttls and self._ttls[key] < self._clock.now():
@@ -120,11 +125,13 @@ class _MockKv:
                 self._ttls[key] = self._clock.now() + ttl_seconds
             elif key in self._ttls:
                 del self._ttls[key]
+            self.writes.append({"op": "set", "key": key, "value": value, "ttl_seconds": ttl_seconds})
 
     def delete(self, key: str) -> None:
         with self._lock:
             self._store.pop(key, None)
             self._ttls.pop(key, None)
+            self.writes.append({"op": "delete", "key": key})
 
     def list(self, prefix: str = "", limit: int = 100) -> List[str]:
         with self._lock:
@@ -138,6 +145,8 @@ class _MockKv:
     def set_many(self, entries: Dict[str, Any]) -> None:
         with self._lock:
             self._store.update(entries)
+            for k, v in entries.items():
+                self.writes.append({"op": "set", "key": k, "value": v, "ttl_seconds": 0})
 
     def exists(self, key: str) -> bool:
         with self._lock:
@@ -147,17 +156,34 @@ class _MockKv:
         with self._lock:
             return len([k for k in self._store if k.startswith(prefix) and not self._is_expired(k)])
 
-    def increment(self, key: str, amount: int = 1) -> int:
+    def increment(self, key: str, *, path: str = "", amount: int = 1) -> Any:
+        """Atomic increment. Mirrors the real ctx.kv.increment signature.
+
+        With ``path`` empty, treats the value as a plain integer. With a
+        ``path``, treats the value as a JSON object and increments that field.
+        """
         with self._lock:
-            current = self._store.get(key, 0)
-            if not isinstance(current, (int, float)):
-                current = 0
-            new_val = int(current) + amount
-            self._store[key] = new_val
+            if path:
+                obj = self._store.get(key)
+                if not isinstance(obj, dict):
+                    obj = {}
+                current = obj.get(path, 0)
+                if not isinstance(current, (int, float)):
+                    current = 0
+                new_val = int(current) + amount
+                obj[path] = new_val
+                self._store[key] = obj
+            else:
+                current = self._store.get(key, 0)
+                if not isinstance(current, (int, float)):
+                    current = 0
+                new_val = int(current) + amount
+                self._store[key] = new_val
+            self.writes.append({"op": "increment", "key": key, "path": path, "amount": amount})
             return new_val
 
     def decrement(self, key: str, amount: int = 1) -> int:
-        return self.increment(key, -amount)
+        return self.increment(key, amount=-amount)
 
     def list_values(self, prefix: str = "", limit: int = 100) -> Dict[str, Any]:
         with self._lock:
@@ -197,6 +223,15 @@ class _MockDiscord:
         self.webhooks_created: List[Dict[str, Any]] = []
         self.webhooks_executed: List[Dict[str, Any]] = []
         self.webhooks_deleted: List[Dict[str, Any]] = []
+        self._message_store: List[Dict[str, Any]] = []
+
+    def set_messages(self, messages: List[Dict[str, Any]]) -> None:
+        """Test helper: seed channel history that get_messages/iter_messages read.
+
+        Each message needs at least an ``id``; before/after/limit are honoured so
+        pagination (and ctx.discord.iter_messages) can be exercised offline.
+        """
+        self._message_store = sorted(messages, key=lambda m: int(m["id"]))
 
     def send_message(self, *, channel_id: str, content: str = "", embeds=None, components=None, files=None) -> Dict[str, Any]:
         msg = {"channel_id": channel_id, "content": content, "embeds": embeds, "components": components, "files": files, "message_id": str(len(self.messages_sent) + 1)}
@@ -235,7 +270,42 @@ class _MockDiscord:
         return []
 
     def get_messages(self, *, channel_id: str, limit=50, before=None, after=None) -> List[Dict[str, Any]]:
-        return []
+        limit = min(max(1, int(limit)), 50)
+        store = sorted(self._message_store, key=lambda m: int(m["id"]))  # ascending
+        if after is not None:
+            # Discord `after` returns the OLDEST `limit` messages newer than the id.
+            cand = [m for m in store if int(m["id"]) > int(after)]
+            page = cand[:limit]
+        elif before is not None:
+            # `before` returns the NEWEST `limit` messages older than the id.
+            cand = [m for m in store if int(m["id"]) < int(before)]
+            page = cand[-limit:]
+        else:
+            page = store[-limit:]  # newest `limit` overall
+        # Discord returns messages newest-first.
+        return sorted(page, key=lambda m: int(m["id"]), reverse=True)
+
+    def iter_messages(self, *, channel_id: str, batch_size: int = 50, before=None, after=None):
+        """Mirror of ctx.discord.iter_messages — pages over set_messages() data."""
+        batch_size = min(max(1, int(batch_size)), 50)
+        forward = after is not None
+        cursor = str(after) if forward else (str(before) if before is not None else None)
+        while True:
+            kwargs: Dict[str, Any] = {"channel_id": channel_id, "limit": batch_size}
+            if cursor is not None:
+                kwargs["after" if forward else "before"] = cursor
+            batch = self.get_messages(**kwargs)
+            if not batch:
+                return
+            for msg in batch:
+                yield msg
+            ids = [int(m["id"]) for m in batch if str(m.get("id", "")).isdigit()]
+            if not ids:
+                return
+            next_cursor = str(max(ids)) if forward else str(min(ids))
+            if next_cursor == cursor or len(batch) < batch_size:
+                return
+            cursor = next_cursor
 
     def add_role(self, *, user_id: str, role_id: str, reason: str = "") -> None:
         self.roles_added.append({"user_id": user_id, "role_id": role_id, "reason": reason})
@@ -346,18 +416,18 @@ class _MockHttp:
         """Configure a mock response for requests matching url_contains."""
         self._mock_responses[url_contains] = {"status": status, "body_bytes": body, "headers": headers or {}, "truncated": False}
 
-    def request(self, method: str, url: str, headers=None, body=None) -> Dict[str, Any]:
-        self.requests.append({"method": method, "url": url, "headers": headers, "body": body})
+    def request(self, method: str, url: str, headers=None, body=None, params=None) -> Dict[str, Any]:
+        self.requests.append({"method": method, "url": url, "headers": headers, "body": body, "params": params})
         for pattern, resp in self._mock_responses.items():
             if pattern in url:
                 return resp
         return {"status": 200, "body_bytes": "", "headers": {}, "truncated": False}
 
-    def get(self, url: str, headers=None) -> Dict[str, Any]:
-        return self.request("GET", url, headers=headers)
+    def get(self, url: str, headers=None, params=None) -> Dict[str, Any]:
+        return self.request("GET", url, headers=headers, params=params)
 
-    def post(self, url: str, body: str = "", headers=None) -> Dict[str, Any]:
-        return self.request("POST", url, headers=headers, body=body)
+    def post(self, url: str, body: str = "", headers=None, params=None) -> Dict[str, Any]:
+        return self.request("POST", url, headers=headers, body=body, params=params)
 
 
 class _MockInteraction:
@@ -400,7 +470,7 @@ class _MockMetrics:
     def record(self, metric: str, value: float = 1.0, tags: Optional[Dict[str, str]] = None) -> None:
         self.recorded.append({"metric": metric, "value": value, "tags": tags or {}})
 
-    def query(self, metric: str, *, period: str = "30d", group_by: Optional[str] = None) -> Dict[str, Any]:
+    def query(self, metric: str, *, period: str = "7d", group_by: Optional[str] = None, aggregate: str = "sum") -> Dict[str, Any]:
         return {"labels": [], "series": [], "total": 0}
 
     def total(self, metric: str, *, period: str = "30d") -> float:
@@ -417,8 +487,8 @@ class _MockSql:
         self.executed.append({"sql": sql, "params": params})
         return 0
 
-    def query(self, sql: str, params: Optional[list] = None) -> List[Dict[str, Any]]:
-        self.executed.append({"sql": sql, "params": params})
+    def query(self, sql: str, params: Optional[list] = None, limit: int = 1000) -> List[Dict[str, Any]]:
+        self.executed.append({"sql": sql, "params": params, "limit": limit})
         return []
 
     def query_one(self, sql: str, params: Optional[list] = None) -> Optional[Dict[str, Any]]:
@@ -434,15 +504,25 @@ class _MockEphemeral:
     """In-memory ephemeral state matching _EphemeralApi interface."""
 
     def __init__(self, clock: Optional[MockClock] = None) -> None:
-        self._counters: Dict[str, int] = {}
+        self._counter_hits: Dict[str, List[float]] = {}  # key -> hit timestamps
         self._cooldowns: Dict[str, float] = {}  # key -> expiry timestamp
         self._seen: Dict[str, float] = {}  # key -> expiry timestamp
         self._flags: Dict[str, float] = {}  # key -> expiry timestamp
         self._clock = clock or MockClock()
 
     def counter(self, key: str, window_seconds: int = 60) -> int:
-        self._counters[key] = self._counters.get(key, 0) + 1
-        return self._counters[key]
+        """Sliding-window counter, matching the real ctx.ephemeral.counter.
+
+        Returns the number of hits within the trailing ``window_seconds``. Hits
+        older than the window are dropped, so with a MockClock you can advance
+        past the window and watch the count reset — essential for accurate
+        rate-limit tests (the old mock was monotonic and never reset).
+        """
+        now = self._clock.now()
+        hits = [t for t in self._counter_hits.get(key, []) if t > now - window_seconds]
+        hits.append(now)
+        self._counter_hits[key] = hits
+        return len(hits)
 
     def cooldown_set(self, key: str, ttl_seconds: int = 60) -> None:
         self._cooldowns[key] = self._clock.now() + ttl_seconds
@@ -466,6 +546,101 @@ class _MockEphemeral:
         return self._flags.get(key, 0) > self._clock.now()
 
 
+# Default capability set for MockContext() when no list is passed — grants
+# everything so existing tests don't need to enumerate capabilities.
+_DEFAULT_MOCK_CAPS = [
+    "storage:kv", "storage:sql", "storage:secrets",
+    "discord:send_message", "discord:edit_message",
+    "discord:delete_message", "discord:add_reaction", "discord:read",
+    "discord:manage_channels", "discord:moderate_members",
+    "discord:ban_members", "discord:kick_members", "discord:manage_roles",
+    "discord:manage_webhooks", "interaction:respond", "proxy:http",
+]
+
+# Method → required capability per Context sub-API. Mirrors §18 of PLUGIN_DEV.md
+# and the real host RPC capability gates, so a handler that works under the mock
+# also has the capabilities it needs in production.
+_KV_CAPS = {m: "storage:kv" for m in (
+    "get", "set", "delete", "list", "get_many", "set_many",
+    "exists", "count", "increment", "decrement", "list_values",
+)}
+_SECRETS_CAPS = {m: "storage:secrets" for m in ("get", "set", "delete")}
+_SQL_CAPS = {m: "storage:sql" for m in ("execute", "query", "query_one", "scalar")}
+_HTTP_CAPS = {m: "proxy:http" for m in ("get", "post", "request")}
+_INTERACTION_CAPS = {m: "interaction:respond" for m in ("respond", "defer", "followup", "send_modal")}
+_DISCORD_CAPS = {
+    "send_message": "discord:send_message",
+    "pin_message": "discord:send_message",
+    "unpin_message": "discord:send_message",
+    "edit_message": "discord:edit_message",
+    "delete_message": "discord:delete_message",
+    "bulk_delete_messages": "discord:delete_message",
+    "add_reaction": "discord:add_reaction",
+    "get_member": "discord:read",
+    "get_channel": "discord:read",
+    "list_roles": "discord:read",
+    "list_members": "discord:read",
+    "search_members": "discord:read",
+    "get_messages": "discord:read",
+    "iter_messages": "discord:read",
+    "get_guild": "discord:read",
+    "list_channels": "discord:read",
+    "create_channel": "discord:manage_channels",
+    "edit_channel": "discord:manage_channels",
+    "delete_channel": "discord:manage_channels",
+    "set_channel_permissions": "discord:manage_channels",
+    "delete_channel_permission": "discord:manage_channels",
+    "create_thread": "discord:manage_channels",
+    "edit_thread": "discord:manage_channels",
+    "create_webhook": "discord:manage_webhooks",
+    "execute_webhook": "discord:manage_webhooks",
+    "delete_webhook": "discord:manage_webhooks",
+    "ban_member": "discord:ban_members",
+    "unban_member": "discord:ban_members",
+    "kick_member": "discord:kick_members",
+    "kick_bulk": "discord:kick_members",
+    "add_role": "discord:manage_roles",
+    "remove_role": "discord:manage_roles",
+    "add_role_bulk": "discord:manage_roles",
+    "remove_role_bulk": "discord:manage_roles",
+    "timeout_member": "discord:moderate_members",
+    "timeout_bulk": "discord:moderate_members",
+    "set_nickname": "discord:moderate_members",
+}
+
+
+class _CapGuard:
+    """Wraps a mock sub-API so gated method calls raise ``CapabilityError`` when
+    the MockContext was created without that capability — mirroring the real host.
+
+    Non-gated methods (``ctx.metrics``, ``ctx.ephemeral``, ``ctx.log``) are never
+    wrapped, and non-method attributes (e.g. ``discord.messages_sent``) pass
+    straight through so assertions keep working.
+    """
+
+    def __init__(self, target: Any, caps: Dict[str, str], has_cap) -> None:
+        self._target = target
+        self._caps = caps
+        self._has_cap = has_cap
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._target, name)
+        cap = self._caps.get(name)
+        if cap is None or not callable(attr):
+            return attr
+        has_cap = self._has_cap
+
+        def _wrapped(*args, **kwargs):
+            if not has_cap(cap):
+                raise CapabilityError(
+                    f"capability {cap} required for {name}() — grant it with "
+                    f"MockContext(capabilities=[{cap!r}, ...]) or add it to your manifest"
+                )
+            return attr(*args, **kwargs)
+
+        return _wrapped
+
+
 class MockContext:
     """Drop-in replacement for Context that records all calls in-memory.
 
@@ -474,6 +649,11 @@ class MockContext:
         ctx = MockContext(server_id="123", plugin_id="my_plugin")
         my_handler(ctx, event)
         assert ctx.messages_sent[0]["content"] == "Hello!"
+
+    By default the mock enforces capabilities: calling a gated method (e.g.
+    ``ctx.discord.send_message``) without the matching capability raises
+    ``CapabilityError``, just like production. Pass ``strict_capabilities=False``
+    to disable this (legacy "everything allowed" behaviour).
     """
 
     def __init__(
@@ -483,18 +663,16 @@ class MockContext:
         version: str = "1.0.0",
         capabilities: Optional[List[str]] = None,
         clock: Optional[MockClock] = None,
+        strict_capabilities: bool = True,
     ) -> None:
         self.server_id = server_id
         self.plugin_id = plugin_id
         self.version = version
-        self.capabilities = set(capabilities or [
-            "storage:kv", "storage:sql", "storage:secrets",
-            "discord:send_message", "discord:edit_message",
-            "discord:delete_message", "discord:add_reaction", "discord:read",
-            "discord:manage_channels", "discord:moderate_members",
-            "discord:ban_members", "discord:kick_members", "discord:manage_roles",
-            "discord:manage_webhooks", "interaction:respond", "proxy:http",
-        ])
+        self.strict_capabilities = strict_capabilities
+        # None → grant all capabilities (back-compat default). An explicit list
+        # (including the empty list) is honoured verbatim, so capabilities=[]
+        # means "no capabilities" — useful for testing capability gating.
+        self.capabilities = set(_DEFAULT_MOCK_CAPS if capabilities is None else capabilities)
         # Synthetic clock for deterministic TTL/cooldown tests; defaults to
         # wall-clock passthrough so existing tests are unaffected.
         self.clock = clock or MockClock()
@@ -508,6 +686,17 @@ class MockContext:
         self.secrets = _MockSecrets()
         self.log_entries: List[Dict[str, Any]] = []
         self._current_interaction_id: Optional[str] = None
+
+        # Enforce capabilities by default so a handler that passes the mock has
+        # the capabilities it needs in production. ctx.metrics / ctx.ephemeral /
+        # ctx.log are ungated and stay unwrapped.
+        if strict_capabilities:
+            self.kv = _CapGuard(self.kv, _KV_CAPS, self.has_capability)
+            self.discord = _CapGuard(self.discord, _DISCORD_CAPS, self.has_capability)
+            self.http = _CapGuard(self.http, _HTTP_CAPS, self.has_capability)
+            self.interaction = _CapGuard(self.interaction, _INTERACTION_CAPS, self.has_capability)
+            self.sql = _CapGuard(self.sql, _SQL_CAPS, self.has_capability)
+            self.secrets = _CapGuard(self.secrets, _SECRETS_CAPS, self.has_capability)
 
     @property
     def request_id(self) -> str:
@@ -552,6 +741,16 @@ class MockContext:
     @property
     def modals_sent(self) -> List[Dict[str, Any]]:
         return self.interaction.modals_sent
+
+    @property
+    def kv_writes(self) -> List[Dict[str, Any]]:
+        """Every mutating ctx.kv call (set/delete/increment/...) the handler made."""
+        return self.kv.writes
+
+    @property
+    def log_lines(self) -> List[str]:
+        """The message text of every ctx.log() call, in order."""
+        return [str(e.get("message", "")) for e in self.log_entries]
 
 
 def make_event(event_type: str, **kwargs) -> dict:

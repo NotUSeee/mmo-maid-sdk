@@ -38,5 +38,10 @@ yourbot = "yourbot_sdk.cli:main"
 where = ["."]
 include = ["yourbot_sdk*", "mmo_maid_sdk*"]
 
+# Ship the PEP 561 ``py.typed`` marker so type checkers (mypy/pyright) pick up the
+# SDK's inline type hints when it's installed from the wheel.
+[tool.setuptools.package-data]
+yourbot_sdk = ["py.typed"]
+
 [tool.setuptools.dynamic]
 version = {attr = "yourbot_sdk.__version__"}
