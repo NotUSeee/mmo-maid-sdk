@@ -919,6 +919,7 @@ class _InteractionApi:
         components: Optional[list] = None,
         ephemeral: bool = False,
         allowed_mentions: Optional[Dict[str, Any]] = None,
+        update_message: bool = False,
     ) -> None:
         """Send an immediate response to the interaction.
 
@@ -931,11 +932,21 @@ class _InteractionApi:
             embeds: List of embed dicts (max 10).
             components: List of ActionRow objects or dicts.
             ephemeral: If True, only the interacting user sees the response.
+                Ignored when ``update_message=True`` (the message being
+                updated keeps its visibility).
             allowed_mentions: Discord allowed_mentions object controlling
                 which mentions actually ping. Common shapes:
                   ``{"parse": []}``                — suppress all pings
                   ``{"parse": ["users"]}``         — only user mentions ping
                   ``{"users": ["123", "456"]}``    — only these user IDs ping
+            update_message: If True, EDIT the message the component is
+                attached to (Discord UPDATE_MESSAGE) instead of sending a
+                new message. Only valid inside a component (button /
+                select menu) interaction handler — the platform rejects it
+                for slash commands and modal submits. The fields you pass
+                REPLACE the message's current content/embeds/components.
+                Use this to update game boards, dashboards, paginated
+                lists, etc. in place.
         """
         payload = {"_interaction_id": self._iid(),
             "content": str(content)[:2000],
@@ -943,6 +954,8 @@ class _InteractionApi:
             "components": [c.to_dict() if hasattr(c, "to_dict") else c for c in (components or [])],
             "ephemeral": bool(ephemeral),
         }
+        if update_message:
+            payload["update_message"] = True
         if allowed_mentions is not None:
             payload["allowed_mentions"] = allowed_mentions
         self._t.call("interaction.respond", payload)

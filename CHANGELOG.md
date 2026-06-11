@@ -3,6 +3,21 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.7.0]
+
+### Added
+
+- **In-place message updates from component handlers.**
+  `ctx.interaction.respond(update_message=True)` edits the message the
+  button/select menu is attached to (Discord `UPDATE_MESSAGE`) instead of
+  sending a new reply — game boards, pagination, and live dashboards can now
+  update in place. Component interactions only; `ephemeral` is ignored; the
+  fields you pass replace the message's current content/embeds/components;
+  may be called repeatedly within the 15-minute interaction window. On
+  platform versions without support the flag is ignored and a normal reply
+  is sent, so it degrades gracefully. `MockContext` records the new flag in
+  `interaction.responses` for assertions.
+
 ## [0.6.1]
 
 ### Added

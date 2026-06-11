@@ -439,10 +439,11 @@ class _MockInteraction:
         self.followups: List[Dict[str, Any]] = []
         self.modals_sent: List[Dict[str, Any]] = []
 
-    def respond(self, content: str = "", embeds=None, components=None, ephemeral: bool = False, allowed_mentions=None) -> None:
+    def respond(self, content: str = "", embeds=None, components=None, ephemeral: bool = False, allowed_mentions=None, update_message: bool = False) -> None:
         self.responses.append({
             "content": content, "embeds": embeds, "components": components,
             "ephemeral": ephemeral, "allowed_mentions": allowed_mentions,
+            "update_message": update_message,
         })
 
     def defer(self, ephemeral: bool = False) -> None:
