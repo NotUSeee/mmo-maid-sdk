@@ -44,7 +44,7 @@ class RateLimitError(SdkError):
     """
     code = "RATE_LIMITED"
 
-    def __init__(self, message: str = "Rate limit exceeded", retry_after: int = 0,
+    def __init__(self, message: str = "Rate limit exceeded", retry_after: float = 0,
                  *, code: Optional[str] = None):
         self.retry_after = retry_after
         super().__init__(message, code=code)

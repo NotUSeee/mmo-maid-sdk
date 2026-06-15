@@ -3,6 +3,24 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.7.1]
+
+### Fixed
+
+- **`ctx.kv.increment(key, amount)` accepts `amount` positionally.** It was
+  keyword-only (`increment(key, *, amount=1)`), so the natural positional call —
+  matching `ctx.kv.decrement(key, amount)` and Redis `INCRBY` — raised
+  `TypeError`. The signature is now `increment(key, amount=1, *, path="")`;
+  existing `amount=`/`path=` keyword calls are unchanged. `MockContext` mirrors it.
+
+### Added
+
+- **Accurate `RateLimitError.retry_after`.** When the host sends structured error
+  metadata (`code`, `retry_after`) the SDK now surfaces the precise retry delay,
+  falling back to parsing `retry in <N>s` from the message, then the legacy
+  `remaining=/min` parse. `retry_after` is now a float to support sub-second and
+  hour-scale limiter windows.
+
 ## [0.7.0]
 
 ### Added

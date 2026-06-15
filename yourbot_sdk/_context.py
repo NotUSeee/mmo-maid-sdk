@@ -142,7 +142,7 @@ class _KvApi:
         """Delete a key (no-op if it doesn't exist)."""
         self._t.call("kv.del", {"key": str(key)})
 
-    def increment(self, key: str, *, path: str = "", amount: int = 1) -> Any:
+    def increment(self, key: str, amount: int = 1, *, path: str = "") -> Any:
         """Atomic increment in a single RPC round-trip.
 
         Much faster than get() + modify + set() for counters.

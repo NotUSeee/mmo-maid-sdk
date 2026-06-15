@@ -42,6 +42,11 @@ class Transport:
         self._pending: Dict[int, threading.Event] = {}
         self._results: Dict[int, Any] = {}
         self._errors: Dict[int, str] = {}
+        # Structured error fields (code/retry_after) shipped by newer hosts
+        # alongside the message. Keyed like _errors; absent for message-only
+        # errors from older hosts, so everything downstream treats it as
+        # optional.
+        self._error_meta: Dict[int, Dict[str, Any]] = {}
         self._next_id = 1
         self._next_id_lock = threading.Lock()
         # Registered notification handlers: method -> callable
@@ -151,6 +156,7 @@ class Transport:
             closed = self._closed
             had_error = rid in self._errors
             err = self._errors.pop(rid, None)
+            meta = self._error_meta.pop(rid, None) or {}
             result = self._results.pop(rid, None)
 
         if not fired:
@@ -161,6 +167,59 @@ class Transport:
         if had_error:
             err = err or "unknown error"
             err_lower = err.lower()
+            import re as _re
+            # Structured fields from newer hosts (validated in _dispatch_message);
+            # both stay None/absent on message-only errors from older hosts.
+            _struct_code = meta.get("code")
+            _retry_field = meta.get("retry_after")
+            # "(retry in <N>s)" appears in hour-scale limiter messages (e.g. the
+            # DDL window) where the legacy remaining=/min parse has nothing to
+            # work with — it is both a retry_after source and a rate-limit signal.
+            _retry_m = _re.search(r"retry in ([\d.]+)s", err_lower)
+
+            def _retry_after_secs() -> float:
+                # Accuracy order: structured retry_after field, then the
+                # "(retry in <N>s)" message parse, then the legacy M4
+                # "remaining=X.X/min" parse, then the historical 5s default.
+                if _retry_field is not None:
+                    return _retry_field
+                if _retry_m:
+                    try:
+                        return float(_retry_m.group(1))
+                    except ValueError:
+                        pass
+                _m = _re.search(r"remaining=([\d.]+)/min", err)
+                if _m:
+                    remaining = float(_m.group(1))
+                    return 60.0 if remaining <= 0 else float(max(1, int(60 / max(remaining, 1))))
+                return 5.0
+
+            # ── Structured code wins over message heuristics ──────────────
+            # Unknown codes deliberately fall through to the substring path so
+            # a newer host can never regress an older mapping.
+            if _struct_code is not None:
+                if _struct_code in ("RATE_LIMITED", "QUOTA_EXCEEDED"):
+                    from ._exceptions import RateLimitError
+                    raise RateLimitError(err, retry_after=_retry_after_secs(), code=_struct_code)
+                if _struct_code == "CAPABILITY_DENIED":
+                    hint = "" if "manifest" in err_lower else (
+                        " (add the capability to capabilities_required in your manifest.json)"
+                    )
+                    raise CapabilityError(err + hint)
+                if _struct_code == "KV_QUOTA_EXCEEDED":
+                    from ._exceptions import KvQuotaError
+                    raise KvQuotaError(err)
+                if _struct_code == "DISCORD_API_ERROR":
+                    from ._exceptions import DiscordApiError
+                    _m = _re.search(r"error\s+(\d{3})", err_lower)
+                    raise DiscordApiError(err, status_code=int(_m.group(1)) if _m else 0)
+                if _struct_code == "BOT_MISSING_PERMISSION":
+                    from ._exceptions import SdkPermissionError
+                    raise SdkPermissionError(err)
+                if _struct_code == "VALIDATION_ERROR":
+                    from ._exceptions import ValidationError
+                    raise ValidationError(err)
+
             if "capability" in err_lower:
                 # Append an actionable hint pointing at the manifest, since this
                 # is the most common first-run failure.
@@ -174,20 +233,12 @@ class Transport:
             if "kv quota" in err_lower or "plugin_kv quota" in err_lower:
                 from ._exceptions import KvQuotaError
                 raise KvQuotaError(err)
-            if "quota exceeded" in err_lower or "rate limit" in err_lower:
+            if "quota exceeded" in err_lower or "rate limit" in err_lower or _retry_m:
                 from ._exceptions import RateLimitError
-                # M4: Parse retry_after from "remaining=X.X/min" in error message
-                _retry = 5  # default: wait 5 seconds
-                import re as _re
-                _m = _re.search(r"remaining=([\d.]+)/min", err)
-                if _m:
-                    remaining = float(_m.group(1))
-                    _retry = 60 if remaining <= 0 else max(1, int(60 / max(remaining, 1)))
                 _code = "QUOTA_EXCEEDED" if "quota exceeded" in err_lower else "RATE_LIMITED"
-                raise RateLimitError(err, retry_after=_retry, code=_code)
+                raise RateLimitError(err, retry_after=_retry_after_secs(), code=_code)
             if "discord api error" in err_lower:
                 from ._exceptions import DiscordApiError
-                import re as _re
                 # WP6: parse "Discord API error 403: ..." — the prior token
                 # split failed because "403:" is not .isdigit().
                 _m = _re.search(r"error\s+(\d{3})", err_lower)
@@ -275,9 +326,28 @@ class Transport:
                 if evt is not None:
                     if "error" in msg:
                         err = msg["error"]
-                        self._errors[msg_id] = (
-                            err.get("message") if isinstance(err, dict) else str(err)
-                        )
+                        if isinstance(err, dict):
+                            _msg = err.get("message")
+                            self._errors[msg_id] = (
+                                _msg if _msg is None or isinstance(_msg, str) else str(_msg)
+                            )
+                            # Newer hosts ship optional structured fields
+                            # alongside message. Validate types here so call()
+                            # can trust the meta dict; old message-only hosts
+                            # simply never populate it.
+                            _meta: Dict[str, Any] = {}
+                            _c = err.get("code")
+                            if isinstance(_c, str) and _c:
+                                _meta["code"] = _c
+                            _ra = err.get("retry_after")
+                            if isinstance(_ra, (int, float)) and not isinstance(_ra, bool) and _ra >= 0:
+                                _meta["retry_after"] = float(_ra)
+                            if _meta:
+                                self._error_meta[msg_id] = _meta
+                        else:
+                            # Legacy/defensive: non-dict error payloads degrade
+                            # to their string form, exactly as before.
+                            self._errors[msg_id] = str(err)
                     else:
                         self._results[msg_id] = msg.get("result")
             if evt is not None:

@@ -156,7 +156,7 @@ class _MockKv:
         with self._lock:
             return len([k for k in self._store if k.startswith(prefix) and not self._is_expired(k)])
 
-    def increment(self, key: str, *, path: str = "", amount: int = 1) -> Any:
+    def increment(self, key: str, amount: int = 1, *, path: str = "") -> Any:
         """Atomic increment. Mirrors the real ctx.kv.increment signature.
 
         With ``path`` empty, treats the value as a plain integer. With a
