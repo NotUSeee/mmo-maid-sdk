@@ -40,6 +40,9 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          # Idempotent re-runs: skip files already on PyPI instead of failing
+          # with 400 (e.g. when only the alias below needs a re-publish).
+          skip-existing: true
 
       # ── Alias meta-package: mmo-maid-sdk ────────────────────────────────────
       # No code — just depends on yourbot-sdk of the same version so legacy
@@ -57,3 +60,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-meta
+          skip-existing: true

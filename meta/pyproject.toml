@@ -14,12 +14,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mmo-maid-sdk"
-version = "0.7.0"
+version = "0.7.1"
 description = "Deprecated alias for yourbot-sdk. Installs the YourBot SDK."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-dependencies = ["yourbot-sdk==0.7.0"]
+dependencies = ["yourbot-sdk==0.7.1"]
 classifiers = [
     "Development Status :: 7 - Inactive",
     "Intended Audience :: Developers",
