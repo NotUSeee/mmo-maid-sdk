@@ -48,7 +48,7 @@ __all__ = [
 # ── Shared helpers ──────────────────────────────────────────────────────────
 
 
-_WIDGET_WIDTHS = {"full", "half", "third", "two_thirds"}
+_WIDGET_WIDTHS = {"full", "half", "third", "two_thirds", "quarter"}
 
 
 def _validate_width(value: Optional[str]) -> Optional[str]:

@@ -3,6 +3,36 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.0]
+
+### Added
+
+- **Persistent WebSocket connections (`ctx.ws`).** A new `proxy:websocket` capability lets a
+  plugin open and maintain a live two-way connection to a declared host. The platform's broker
+  holds the socket (the sandbox still has no raw network) and reconnects automatically.
+  - `ctx.ws.ensure(name, url, *, secret_auth=None, auth=None, subscribe=None, binary=False)` —
+    idempotent; safe to call on every event or in `on_ready`.
+  - `ctx.ws.send(name, data)` — `str` sends a text frame, `bytes` a binary frame.
+  - `ctx.ws.close(name)`.
+  - Inbound frames are delivered to `@plugin.on_ws_message(name)` (`(ctx, msg)` where
+    `msg = {"name", "conn_id", "data", "binary"}`; binary `data` is base64), with
+    `@plugin.on_ws_open(name)` and `@plugin.on_ws_close(name)` for lifecycle. Frames for one
+    connection are serialized in order. Suitable for game-server feeds and the Rust+ companion
+    protocol (bundle pure-Python protobuf in your ZIP).
+- **Secret-backed auth injection for `ctx.http` and `ctx.ws`.** Pass `secret_auth="SECRET_NAME"`
+  (or `auth={"scheme": "bearer"|"basic"|"token", "secret": "NAME"}`) and the platform injects the
+  `Authorization` header from a **domain-bound** secret — the plugin never sees the value and
+  cannot set `Authorization` itself. This unblocks Bearer-token APIs that were previously
+  unreachable because `Authorization` is stripped. Requires `storage:secrets`.
+- **`quarter` dashboard widget width** alongside `full` / `half` / `third` / `two_thirds`.
+- **`MockContext.ws`** in the test harness records `ensure` / `send` / `close` calls and is
+  capability-gated like `ctx.http`, so WebSocket plugins are unit-testable.
+
+### Notes
+
+- `proxy:websocket` is a dangerous-tier capability (staff-reviewed) and requires the **exact**
+  host in `proxy_domains_requested` (no subdomain wildcard, unlike HTTP).
+
 ## [0.7.1]
 
 ### Fixed

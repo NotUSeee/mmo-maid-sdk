@@ -851,6 +851,8 @@ class _HttpApi:
         headers: Optional[Dict[str, str]] = None,
         body: Optional[str] = None,
         params: Optional[Dict[str, Any]] = None,
+        secret_auth: Optional[str] = None,
+        auth: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Make an HTTP request.  Only approved domains are reachable.
 
@@ -860,6 +862,13 @@ class _HttpApi:
         string is appended to ``url`` with the correct separator (``?``
         or ``&``).
 
+        ``secret_auth`` is the NAME of a stored secret (requires the
+        ``storage:secrets`` capability and the secret must be bound to this
+        URL's domain). The platform resolves it and sets the ``Authorization:
+        Bearer <value>`` header for you — you never see the value, and you
+        cannot set ``Authorization`` yourself (it is stripped). For a non-bearer
+        scheme pass ``auth={"scheme": "basic"|"token", "secret": "KEY_NAME"}``.
+
         Returns: status (int), headers (dict), body_bytes (str), truncated (bool).
         """
         if params:
@@ -867,10 +876,15 @@ class _HttpApi:
             query_string = _up.urlencode(params, doseq=True)
             if query_string:
                 url = f"{url}{'&' if '?' in url else '?'}{query_string}"
-        result = self._t.call("proxy.request", {
+        rpc_params: Dict[str, Any] = {
             "method": method.upper(), "url": url,
             "headers": headers or {}, "body": body,
-        })
+        }
+        if secret_auth:
+            rpc_params["secret_auth"] = secret_auth
+        if auth:
+            rpc_params["auth"] = auth
+        result = self._t.call("proxy.request", rpc_params)
         return result or {}
 
     def get(
@@ -889,6 +903,68 @@ class _HttpApi:
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return self.request("POST", url, headers=headers, body=body, params=params)
+
+
+class _WsApi:
+    """ctx.ws — persistent WebSocket connections (requires proxy:websocket).
+
+    The platform's broker holds the actual socket; your plugin sends and
+    receives frames through it. Connections are identified by a short ``name``
+    you choose. Inbound frames arrive as events — register handlers with
+    ``@plugin.on_ws_message(name)`` / ``on_ws_open`` / ``on_ws_close``.
+
+    Pool-safe: ``ensure`` is idempotent, so call it whenever you need the
+    connection (e.g. on the first event, or in ``on_ready``) — repeat calls for
+    the same name are a no-op.
+    """
+
+    def __init__(self, transport: "Transport") -> None:
+        self._t = transport
+
+    def ensure(
+        self,
+        name: str,
+        url: str,
+        *,
+        secret_auth: Optional[str] = None,
+        auth: Optional[Dict[str, Any]] = None,
+        subscribe: Optional[List[Any]] = None,
+        binary: bool = False,
+    ) -> Dict[str, Any]:
+        """Idempotently open (or confirm) a managed WebSocket to ``url``.
+
+        ``url`` must be ``wss://`` (or ``ws://``) and the exact host must be in
+        your ``proxy_domains_requested``. ``secret_auth`` is a stored secret
+        NAME bound to that host (the platform injects ``Authorization: Bearer
+        <value>`` on connect; you never see it). ``subscribe`` is a list of
+        frames sent right after every (re)connect — the place to (re)subscribe.
+        Set ``binary=True`` for binary protocols (e.g. protobuf); inbound binary
+        frames are delivered base64-encoded.
+
+        Returns ``{"conn_id", "name", "state"}``. There is no socket object —
+        the platform owns it.
+        """
+        a = auth
+        if secret_auth:
+            a = {"scheme": "bearer", "secret": secret_auth}
+        return self._t.call("ws.ensure", {
+            "name": name, "url": url, "auth": a,
+            "subscribe": list(subscribe or []), "binary": bool(binary),
+        }) or {}
+
+    def send(self, name: str, data: Any) -> Dict[str, Any]:
+        """Send one frame on the named connection. ``str`` -> text frame;
+        ``bytes`` -> binary frame (sent as base64 over the wire to the broker)."""
+        if isinstance(data, (bytes, bytearray)):
+            import base64
+            params = {"name": name, "data_b64": base64.b64encode(bytes(data)).decode("ascii")}
+        else:
+            params = {"name": name, "text": str(data)}
+        return self._t.call("ws.send", params) or {}
+
+    def close(self, name: str) -> Dict[str, Any]:
+        """Close the named connection (idempotent)."""
+        return self._t.call("ws.close", {"name": name}) or {}
 
 
 class _InteractionApi:
@@ -1046,6 +1122,7 @@ class Context:
         kv           Key-value storage API
         discord      Discord actions API
         http         HTTP proxy API
+        ws           Persistent WebSocket API (requires proxy:websocket)
         interaction  Interaction response API (slash commands, buttons, modals)
         metrics      Time-series metrics API (available to all plugins)
         sql          Sandboxed SQL API (requires storage:sql capability)
@@ -1065,6 +1142,7 @@ class Context:
         self.kv          = _KvApi(transport)
         self.discord     = _DiscordApi(transport)
         self.http        = _HttpApi(transport)
+        self.ws          = _WsApi(transport)
         self.interaction = _InteractionApi(transport, ctx=self)
         self.metrics     = _MetricsApi(transport)
         self.sql         = _SqlApi(transport)

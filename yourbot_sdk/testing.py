@@ -416,18 +416,47 @@ class _MockHttp:
         """Configure a mock response for requests matching url_contains."""
         self._mock_responses[url_contains] = {"status": status, "body_bytes": body, "headers": headers or {}, "truncated": False}
 
-    def request(self, method: str, url: str, headers=None, body=None, params=None) -> Dict[str, Any]:
-        self.requests.append({"method": method, "url": url, "headers": headers, "body": body, "params": params})
+    def request(self, method: str, url: str, headers=None, body=None, params=None,
+                secret_auth=None, auth=None) -> Dict[str, Any]:
+        self.requests.append({"method": method, "url": url, "headers": headers, "body": body,
+                              "params": params, "secret_auth": secret_auth, "auth": auth})
         for pattern, resp in self._mock_responses.items():
             if pattern in url:
                 return resp
         return {"status": 200, "body_bytes": "", "headers": {}, "truncated": False}
 
-    def get(self, url: str, headers=None, params=None) -> Dict[str, Any]:
-        return self.request("GET", url, headers=headers, params=params)
+    def get(self, url: str, headers=None, params=None, secret_auth=None, auth=None) -> Dict[str, Any]:
+        return self.request("GET", url, headers=headers, params=params, secret_auth=secret_auth, auth=auth)
 
-    def post(self, url: str, body: str = "", headers=None, params=None) -> Dict[str, Any]:
-        return self.request("POST", url, headers=headers, body=body, params=params)
+    def post(self, url: str, body: str = "", headers=None, params=None, secret_auth=None, auth=None) -> Dict[str, Any]:
+        return self.request("POST", url, headers=headers, body=body, params=params, secret_auth=secret_auth, auth=auth)
+
+
+class _MockWs:
+    """Records ctx.ws.* calls for assertion in tests.
+
+    No real socket — ``ensure`` returns a connecting stub. To simulate inbound
+    frames in a test, dispatch an event to your ``@on_ws_message`` handler
+    directly (the harness does not run the broker).
+    """
+
+    def __init__(self) -> None:
+        self.ensured: List[Dict[str, Any]] = []
+        self.sent: List[Dict[str, Any]] = []
+        self.closed: List[str] = []
+
+    def ensure(self, name: str, url: str, *, secret_auth=None, auth=None, subscribe=None, binary: bool = False) -> Dict[str, Any]:
+        self.ensured.append({"name": name, "url": url, "secret_auth": secret_auth,
+                             "auth": auth, "subscribe": list(subscribe or []), "binary": binary})
+        return {"conn_id": f"mock-{name}", "name": name, "state": "connecting"}
+
+    def send(self, name: str, data: Any) -> Dict[str, Any]:
+        self.sent.append({"name": name, "data": data})
+        return {"ok": True}
+
+    def close(self, name: str) -> Dict[str, Any]:
+        self.closed.append(name)
+        return {"ok": True}
 
 
 class _MockInteraction:
@@ -568,6 +597,7 @@ _KV_CAPS = {m: "storage:kv" for m in (
 _SECRETS_CAPS = {m: "storage:secrets" for m in ("get", "set", "delete")}
 _SQL_CAPS = {m: "storage:sql" for m in ("execute", "query", "query_one", "scalar")}
 _HTTP_CAPS = {m: "proxy:http" for m in ("get", "post", "request")}
+_WS_CAPS = {m: "proxy:websocket" for m in ("ensure", "send", "close")}
 _INTERACTION_CAPS = {m: "interaction:respond" for m in ("respond", "defer", "followup", "send_modal")}
 _DISCORD_CAPS = {
     "send_message": "discord:send_message",
@@ -680,6 +710,7 @@ class MockContext:
         self.kv = _MockKv(clock=self.clock)
         self.discord = _MockDiscord()
         self.http = _MockHttp()
+        self.ws = _MockWs()
         self.interaction = _MockInteraction()
         self.metrics = _MockMetrics()
         self.sql = _MockSql()
@@ -695,6 +726,7 @@ class MockContext:
             self.kv = _CapGuard(self.kv, _KV_CAPS, self.has_capability)
             self.discord = _CapGuard(self.discord, _DISCORD_CAPS, self.has_capability)
             self.http = _CapGuard(self.http, _HTTP_CAPS, self.has_capability)
+            self.ws = _CapGuard(self.ws, _WS_CAPS, self.has_capability)
             self.interaction = _CapGuard(self.interaction, _INTERACTION_CAPS, self.has_capability)
             self.sql = _CapGuard(self.sql, _SQL_CAPS, self.has_capability)
             self.secrets = _CapGuard(self.secrets, _SECRETS_CAPS, self.has_capability)

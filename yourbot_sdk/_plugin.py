@@ -56,6 +56,13 @@ class Plugin:
         self._cron_tasks: List[tuple] = []  # (fn, parsed_cron_spec, raw_spec)
         self._scheduled_threads: List[threading.Thread] = []
         self._lifecycle_handlers: Dict[str, Callable] = {}  # "install"/"enable"/"disable"/"uninstall" → fn
+        # WebSocket frame handlers, keyed by connection name then kind
+        # ("message"/"open"/"close"). Frames are fire-and-forget (no ack).
+        self._ws_handlers: Dict[str, Dict[str, List[Callable]]] = {}
+        # Per-connection lock so frames for one connection run in order even
+        # though the transport dispatches notifications across N threads.
+        self._ws_locks: Dict[str, threading.Lock] = {}
+        self._ws_locks_guard = threading.Lock()
         self._ctx: Optional[Context] = None
         # F38: track whether we're in pool mode
         self._pool_mode: bool = False
@@ -126,6 +133,35 @@ class Plugin:
             self._event_handlers.setdefault(event_type, []).append(fn)
             return fn
         return decorator
+
+    def _register_ws(self, name: str, kind: str, fn: Callable) -> Callable:
+        self._ws_handlers.setdefault(name, {}).setdefault(kind, []).append(fn)
+        return fn
+
+    def on_ws_message(self, name: str) -> Callable:
+        """Register a handler for inbound frames on the named WebSocket connection.
+
+        The function receives ``(ctx, frame)`` where ``frame`` is
+        ``{"name", "conn_id", "data", "binary"}``. For ``binary=True`` frames,
+        ``data`` is base64-encoded (decode with ``base64.b64decode``). Requires
+        the ``proxy:websocket`` capability and a matching ``ctx.ws.ensure(name, ...)``.
+        """
+        return lambda fn: self._register_ws(name, "message", fn)
+
+    def on_ws_open(self, name: str) -> Callable:
+        """Register a handler called each time the named connection (re)connects.
+
+        Receives ``(ctx)``. This is the place to (re)send any auth/subscribe
+        frames — though ``ctx.ws.ensure(subscribe=[...])`` does that automatically.
+        """
+        return lambda fn: self._register_ws(name, "open", fn)
+
+    def on_ws_close(self, name: str) -> Callable:
+        """Register a handler called when the named connection closes or drops.
+
+        Receives ``(ctx, info)`` where ``info`` is ``{"reason", "will_reconnect"}``.
+        """
+        return lambda fn: self._register_ws(name, "close", fn)
 
     def on_slash_command(self, command_name: str) -> Callable:
         """Register a handler for a specific slash command.
@@ -367,6 +403,17 @@ class Plugin:
                 return handler
             self._transport.register_handler(method, make_handler(event_type))
 
+        # WebSocket inbound frames: separate, ack-free notification methods so a
+        # frame flood can never enter the durable event ack/reclaim path.
+        for _kind, _method in (("message", "event.ws_message"),
+                               ("open", "event.ws_open"),
+                               ("close", "event.ws_closed")):
+            def make_ws_handler(kind):
+                def handler(params: dict):
+                    self._dispatch_ws(kind, params)
+                return handler
+            self._transport.register_handler(_method, make_ws_handler(_kind))
+
         # Register dashboard data handlers (request-response pattern)
         # Platform sends "dashboard.{method_name}" with an "id" field,
         # expecting a JSON-RPC response with the widget data.
@@ -577,6 +624,65 @@ class Plugin:
                 self._ack_buffer.append(event_id)
                 if len(self._ack_buffer) >= self._ACK_FLUSH_SIZE:
                     self._flush_ack_buffer_locked()
+
+    def _dispatch_ws(self, kind: str, params: dict) -> None:
+        """Route an inbound WebSocket notification to ws handlers by name.
+
+        Fire-and-forget: there is no event_id and no ack — a stale live frame
+        is never retried. Frames for one connection are serialized by a per-name
+        lock so handlers see them in order despite N dispatcher threads.
+        """
+        if self._ctx is None:
+            return
+        name = str(params.get("name") or "")
+        if not name or name not in self._ws_handlers:
+            return
+
+        # Pool-aware ctx, same ceiling-intersection as _dispatch_event.
+        if self._pool_mode:
+            event_caps = list(params.get("capabilities") or [])
+            boot_caps = set(self._ctx.capabilities) if self._ctx else set()
+            safe_caps = [c for c in event_caps if c in boot_caps] if boot_caps else event_caps
+            ctx = Context(
+                server_id=str(params.get("discord_srv_id") or ""),
+                plugin_id=str(params.get("plugin_id") or self._ctx.plugin_id),
+                version=str(params.get("version") or self._ctx.version),
+                capabilities=safe_caps,
+                transport=self._transport,
+            )
+        else:
+            ctx = self._ctx
+
+        handlers = self._ws_handlers.get(name, {}).get(kind, [])
+        if not handlers:
+            return
+
+        with self._ws_locks_guard:
+            lock = self._ws_locks.setdefault(name, threading.Lock())
+
+        frame = {
+            "name": name,
+            "conn_id": params.get("conn_id"),
+            "data": params.get("data"),
+            "binary": bool(params.get("binary")),
+            "reason": params.get("reason"),
+            "will_reconnect": params.get("will_reconnect"),
+        }
+        with lock:
+            for fn in handlers:
+                try:
+                    if kind == "open":
+                        fn(ctx)
+                    elif kind == "close":
+                        fn(ctx, {"reason": frame["reason"], "will_reconnect": frame["will_reconnect"]})
+                    else:
+                        fn(ctx, frame)
+                except Exception:
+                    try:
+                        ctx.log(f"ws handler error ({kind}/{name}):\n{_traceback.format_exc()[:3900]}",
+                                level="error")
+                    except Exception:
+                        pass
 
     def _flush_ack_buffer(self) -> None:
         """Send buffered event acks (thread-safe wrapper)."""
