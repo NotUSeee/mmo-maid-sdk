@@ -966,6 +966,27 @@ class _WsApi:
         """Close the named connection (idempotent)."""
         return self._t.call("ws.close", {"name": name}) or {}
 
+    def allow_host(self, host: str) -> Dict[str, Any]:
+        """Authorize this server to open WebSocket connections to ``host``.
+
+        For connecting to a destination the SERVER ADMIN supplies at setup time
+        (e.g. their own game server's IP) — which a static manifest allowlist
+        can't express. MUST be called from inside a slash-command handler run by
+        a server admin (Manage Server): the platform verifies the invoking member
+        is an admin and that ``host`` is a public address, then remembers it for
+        THIS server only. After approval, ``ctx.ws.ensure(name, "wss://<host>:...")``
+        to that host succeeds.
+
+        ``host`` may be an IP, ``ip:port``, hostname, or a ``wss://`` URL (only the
+        host part is used). Raises if the caller isn't an admin or the host isn't
+        public. Idempotent.
+        """
+        return self._t.call("ws.allow_host", {"host": host}) or {}
+
+    def revoke_host(self, host: str) -> Dict[str, Any]:
+        """Revoke a previously approved host for this server (admin only)."""
+        return self._t.call("ws.revoke_host", {"host": host}) or {}
+
 
 class _InteractionApi:
     """ctx.interaction — respond to slash commands, buttons, selects, and modals.

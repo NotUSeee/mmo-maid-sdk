@@ -444,6 +444,8 @@ class _MockWs:
         self.ensured: List[Dict[str, Any]] = []
         self.sent: List[Dict[str, Any]] = []
         self.closed: List[str] = []
+        self.allowed_hosts: List[str] = []
+        self.revoked_hosts: List[str] = []
 
     def ensure(self, name: str, url: str, *, secret_auth=None, auth=None, subscribe=None, binary: bool = False) -> Dict[str, Any]:
         self.ensured.append({"name": name, "url": url, "secret_auth": secret_auth,
@@ -457,6 +459,14 @@ class _MockWs:
     def close(self, name: str) -> Dict[str, Any]:
         self.closed.append(name)
         return {"ok": True}
+
+    def allow_host(self, host: str) -> Dict[str, Any]:
+        self.allowed_hosts.append(host)
+        return {"ok": True, "host": host}
+
+    def revoke_host(self, host: str) -> Dict[str, Any]:
+        self.revoked_hosts.append(host)
+        return {"ok": True, "host": host}
 
 
 class _MockInteraction:
@@ -597,7 +607,7 @@ _KV_CAPS = {m: "storage:kv" for m in (
 _SECRETS_CAPS = {m: "storage:secrets" for m in ("get", "set", "delete")}
 _SQL_CAPS = {m: "storage:sql" for m in ("execute", "query", "query_one", "scalar")}
 _HTTP_CAPS = {m: "proxy:http" for m in ("get", "post", "request")}
-_WS_CAPS = {m: "proxy:websocket" for m in ("ensure", "send", "close")}
+_WS_CAPS = {m: "proxy:websocket" for m in ("ensure", "send", "close", "allow_host", "revoke_host")}
 _INTERACTION_CAPS = {m: "interaction:respond" for m in ("respond", "defer", "followup", "send_modal")}
 _DISCORD_CAPS = {
     "send_message": "discord:send_message",

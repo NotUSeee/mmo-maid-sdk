@@ -3,6 +3,18 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.1]
+
+### Added
+
+- **`ctx.ws.allow_host(host)` / `ctx.ws.revoke_host(host)`** — authorize a WebSocket
+  destination the SERVER ADMIN supplies at setup time (e.g. their own game server's IP),
+  which a static `proxy_domains_requested` allowlist can't express. Must be called from
+  inside a slash-command handler run by a server admin (Manage Server); the platform verifies
+  the invoking member is an admin and that the host is public, then remembers it for that
+  server only. After approval, `ctx.ws.ensure(name, "wss://<host>:...")` to that host succeeds.
+  `MockContext.ws` records `allowed_hosts` / `revoked_hosts`.
+
 ## [0.8.0]
 
 ### Added
