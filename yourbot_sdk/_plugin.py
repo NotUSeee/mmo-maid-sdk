@@ -625,6 +625,16 @@ class Plugin:
                 if len(self._ack_buffer) >= self._ACK_FLUSH_SIZE:
                     self._flush_ack_buffer_locked()
 
+    def _match_ws_keys(self, name: str) -> List[str]:
+        """Resolve the registered handler keys that apply to a concrete connection
+        ``name``. An exact registration wins; otherwise any registration ending in
+        ``*`` whose prefix matches (e.g. ``"rustplus:*"`` matches ``"rustplus:eu1"``)
+        applies — so a plugin managing many connections registers one handler set.
+        """
+        if name in self._ws_handlers:
+            return [name]
+        return [k for k in self._ws_handlers if k.endswith("*") and name.startswith(k[:-1])]
+
     def _dispatch_ws(self, kind: str, params: dict) -> None:
         """Route an inbound WebSocket notification to ws handlers by name.
 
@@ -635,7 +645,10 @@ class Plugin:
         if self._ctx is None:
             return
         name = str(params.get("name") or "")
-        if not name or name not in self._ws_handlers:
+        if not name:
+            return
+        match_keys = self._match_ws_keys(name)
+        if not match_keys:
             return
 
         # Pool-aware ctx, same ceiling-intersection as _dispatch_event.
@@ -653,7 +666,7 @@ class Plugin:
         else:
             ctx = self._ctx
 
-        handlers = self._ws_handlers.get(name, {}).get(kind, [])
+        handlers = [h for k in match_keys for h in self._ws_handlers.get(k, {}).get(kind, [])]
         if not handlers:
             return
 

@@ -3,6 +3,16 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.2]
+
+### Added
+
+- **Wildcard WebSocket handlers.** `@plugin.on_ws_message("name:*")` (and `on_ws_open`/
+  `on_ws_close`) now match any concrete connection whose name shares the prefix — e.g.
+  `"rustplus:*"` handles `rustplus:eu1`, `rustplus:us-west`, etc. Lets a plugin manage many
+  connections (one socket per game server) with a single handler set; the concrete `name` is
+  in the frame so you can route per-connection. Exact-name registrations still take precedence.
+
 ## [0.8.1]
 
 ### Added
