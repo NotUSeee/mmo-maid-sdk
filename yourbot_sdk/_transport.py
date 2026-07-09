@@ -11,13 +11,54 @@ Fixes applied:
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import queue as _queue
 import sys
 import threading
 import traceback as _traceback
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
+
+# C5 (cross-tenant context drift): the runner issues a unique event_id in every
+# event notification it sends to the plugin. The handler dispatch sets this
+# ContextVar to the (event_id, server_id) of the event currently being handled,
+# and Transport.call() echoes the event_id back on every outbound RPC. The host
+# then resolves the RPC's tenant by that trusted event_id instead of "most
+# recently set context", which leaks across servers in pool mode.
+#
+# Why a ContextVar (not threading.local): event handlers run synchronously
+# inside the dispatch thread that pulls from _dispatch_queue, and call() runs in
+# the same call stack — so the value set at dispatch time is visible to call().
+# ContextVars are isolated per-thread by default, so concurrent dispatch threads
+# each carry their own event_id; and if handlers ever become coroutines the value
+# still propagates across await. Background tasks (schedule/cron/on_ready) run on
+# their own threads with this UNSET, so call() injects nothing and the host falls
+# back to its existing behavior — making this change strictly additive.
+_current_event: "contextvars.ContextVar[Optional[Tuple[str, str]]]" = contextvars.ContextVar(
+    "yourbot_current_event", default=None
+)
+
+
+def set_current_event(event_id: Optional[str], server_id: Optional[str] = None) -> "contextvars.Token":
+    """Bind the current event correlator for the duration of one handler.
+
+    Returns a token; pass it to ``reset_current_event`` in a ``finally`` so the
+    correlator never leaks into the next event dispatched on the same thread.
+    """
+    return _current_event.set(
+        (str(event_id), str(server_id or "")) if event_id else None
+    )
+
+
+def reset_current_event(token: "contextvars.Token") -> None:
+    """Restore the previous event correlator (paired with set_current_event)."""
+    try:
+        _current_event.reset(token)
+    except Exception:
+        # A reset can only fail if the token came from a different Context; in
+        # that case force-clear so we never leave a stale correlator behind.
+        _current_event.set(None)
 
 
 class Transport:
@@ -142,6 +183,22 @@ class Transport:
             if self._closed:
                 raise RpcTimeoutError(f"RPC aborted: transport closed ({method})")
             self._pending[rid] = evt
+
+        # C5: stamp the current event's runner-issued event_id (and, as a
+        # best-effort hint only, its server_id) so the host can resolve THIS
+        # call's tenant by the trusted event_id rather than "most recent".
+        # Only when a handler is active — background tasks leave _current_event
+        # unset, so we emit exactly the legacy frame (no _event_id) and the host
+        # keeps its current resolution. We copy params so we never mutate the
+        # caller's dict, and never overwrite a key the caller already set.
+        cur = _current_event.get()
+        if cur is not None:
+            _eid, _srv = cur
+            if _eid and (not isinstance(params, dict) or "_event_id" not in params):
+                params = dict(params) if isinstance(params, dict) else {}
+                params["_event_id"] = _eid
+                if _srv and "_pool_discord_srv_id" not in params:
+                    params["_pool_discord_srv_id"] = _srv
 
         self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
 

@@ -3,6 +3,37 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.3]
+
+### Added
+
+- **Slash-command consistency checks in `mmo validate`.** The local validator
+  now cross-checks `manifest.json` `slash_commands` against your
+  `@plugin.on_slash_command` decorators, exactly like the platform does at
+  upload and in the Plugin Builder preview: a declared command with no matching
+  handler is a blocking error (it would appear in Discord and hang on
+  "thinking…" forever), an uppercase decorator name is a blocking error
+  (registration lowercases the name, dispatch matches exactly), reserved names
+  owned by built-in YourBot plugins are refused, and command/option names must
+  be 1-32 chars of lowercase letters, digits, `-` or `_` with a valid option
+  `type`. A handler with no manifest entry warns (it registers with no
+  description and no options). Fix mismatches locally instead of discovering
+  them after a failed upload.
+- **`proxy:websocket` capability detection.** `mmo validate` and capability
+  auto-detection now recognize `ctx.ws.*` usage, so WebSocket plugins no longer
+  validate green locally while missing the capability at upload.
+
+### Fixed
+
+- **Pool-mode tenant resolution hardened (now actually shipped).** Every
+  outbound RPC carries the correlation ID of the event that triggered it, so
+  the host resolves the RPC's tenant from that trusted ID instead of "most
+  recent event". This fix was documented for 0.7.1 but the code did not make
+  it into the published wheel; 0.8.3 ships it. No public API change.
+- **Dashboard handler error logs name the right handler.** With multiple
+  `@plugin.on_dashboard` handlers, an error log previously always reported the
+  last-registered method name instead of the one that failed.
+
 ## [0.8.2]
 
 ### Added

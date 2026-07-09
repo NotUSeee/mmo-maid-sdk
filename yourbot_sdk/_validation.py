@@ -149,6 +149,10 @@ _CAP_PATTERNS: list[tuple[bytes, str]] = [
     (b".http.get(",        "proxy:http"),
     (b".http.post(",       "proxy:http"),
     (b".http.request(",    "proxy:http"),
+    # proxy:websocket — persistent WebSocket connections (ctx.ws.*)
+    (b".ws.ensure(",       "proxy:websocket"),
+    (b".ws.send(",         "proxy:websocket"),
+    (b".ws.connect(",      "proxy:websocket"),
     # events:message_content — accessing message text
     (b'("content"',        "events:message_content"),
     (b"('content'",        "events:message_content"),
@@ -457,6 +461,26 @@ def validate_artifact(
                          "likely to install plugins that ask for fewer permissions.",
                 )
 
+    # 5c. Slash-command consistency — the checks that keep "what the dev
+    # reviewed" equal to "what Discord runs". Discord registration is driven
+    # solely by manifest.slash_commands (names lowercased by the platform),
+    # while runtime dispatch is driven solely by @plugin.on_slash_command
+    # decorators (matched case-sensitively by the SDK). A drifted name ships a
+    # command that registers but never answers. Mirrors the platform validator
+    # and its publish-time reserved/duplicate/charset gate.
+    # NOTE: the publish-time auto-merge scans EVERY .py in the zip (no test/
+    # vendor exclusion), so this check must scan the same set.
+    if manifest_dict is not None:
+        cmd_scan_sources: list[bytes] = []
+        for n in namelist:
+            if not n.endswith(".py"):
+                continue
+            try:
+                cmd_scan_sources.append(zf.read(n))
+            except Exception:
+                continue
+        _validate_slash_commands(result, manifest_dict, cmd_scan_sources)
+
     # 6. Forbidden patterns (would actually fail at sandbox runtime).
     for path in py_paths:
         try:
@@ -488,6 +512,260 @@ def validate_artifact(
             break
 
     return result
+
+
+# ── Slash-command consistency (vendored from plugin_validation.py) ─────────
+
+# @<ident>.on_slash_command("name") with single or double quotes — vendored
+# from artifact_store._SLASH_CMD_RE (the platform's publish-time auto-merge
+# uses the same pattern, so local and platform scans can never disagree).
+_SLASH_CMD_RE = re.compile(
+    rb'@\w+\.on_slash_command\s*\(\s*["\']([a-zA-Z0-9_\-]+)["\']\s*\)'
+)
+
+# Discord command/option names: 1-32 chars of letters, digits, - and _
+# (Discord additionally requires lowercase, checked separately so the error
+# can say so).
+_CMD_NAME_RE = re.compile(r"^[-_\w]{1,32}$")
+
+# Discord ApplicationCommandOptionType values.
+_VALID_OPTION_TYPES = set(range(1, 12))
+
+# Top-level command names reserved by built-in YourBot plugins + platform
+# commands. Vendored from the platform's command_registry.reserved_command_names()
+# — a CI parity test on the platform side keeps this set in sync.
+_RESERVED_COMMAND_NAMES = {
+    "announce", "appeal", "ban", "beacon", "case", "giveaway", "group",
+    "group-admin", "group-alerts", "history", "kick", "leaderboard",
+    "lockdown", "maid-bug-report", "music", "note", "poll", "purge",
+    "quarantine", "quests", "raidmode", "report", "slowmode", "stats",
+    "temp-role", "ticket", "tickets", "timeout", "unban", "unlockdown",
+    "unquarantine", "untimeout", "warn", "welcome",
+}
+
+
+def _walk_command_options(
+    result: ValidationResult, cmd_name: str, options: Any, depth: int = 0,
+) -> None:
+    """Validate one command's options array (recursing into subcommands).
+
+    Option names and types go to Discord verbatim (slash_sync only fills in
+    empty descriptions) — one illegal option 400s the ENTIRE guild bulk PUT
+    and wedges every marketplace command sync for that guild behind the error
+    backoff, so these are blocking errors."""
+    if options is None:
+        return
+    if not isinstance(options, list):
+        result.add(
+            "error", "command_options_not_list",
+            f"Command \"/{cmd_name}\": \"options\" must be a JSON array.",
+            path="manifest.json",
+        )
+        return
+    if depth > 2:  # Discord allows at most group > subcommand > options
+        return
+    for opt in options:
+        if not isinstance(opt, dict):
+            result.add(
+                "error", "command_option_malformed",
+                f"Command \"/{cmd_name}\" has an option that is not a JSON object.",
+                path="manifest.json",
+            )
+            continue
+        oname = str(opt.get("name") or "").strip()
+        if not oname:
+            result.add(
+                "error", "command_option_missing_name",
+                f"Command \"/{cmd_name}\" has an option with no \"name\".",
+                path="manifest.json",
+            )
+        elif oname != oname.lower() or not _CMD_NAME_RE.match(oname):
+            result.add(
+                "error", "command_option_name_invalid",
+                f"Command \"/{cmd_name}\" option \"{oname}\" is not a valid "
+                f"Discord option name.",
+                path="manifest.json",
+                hint="Option names must be 1-32 chars of lowercase letters, "
+                     "digits, - or _. Discord rejects the whole command batch "
+                     "for one bad name, which blocks every plugin command on "
+                     "the server.",
+            )
+        otype = opt.get("type")
+        if otype is None:
+            result.add(
+                "error", "command_option_missing_type",
+                f"Command \"/{cmd_name}\" option \"{oname or '?'}\" has no \"type\".",
+                path="manifest.json",
+                hint="Set \"type\": 3=string, 4=integer, 5=boolean, 6=user, "
+                     "7=channel, 8=role, 10=number.",
+            )
+        elif not isinstance(otype, int) or otype not in _VALID_OPTION_TYPES:
+            result.add(
+                "error", "command_option_type_invalid",
+                f"Command \"/{cmd_name}\" option \"{oname or '?'}\" has invalid "
+                f"type {otype!r} (must be an integer 1-11).",
+                path="manifest.json",
+            )
+        if opt.get("options") is not None:
+            _walk_command_options(result, cmd_name, opt.get("options"), depth + 1)
+
+
+def _validate_slash_commands(
+    result: ValidationResult, manifest_dict: dict, py_sources: list[bytes],
+) -> None:
+    """Cross-check manifest.slash_commands against @on_slash_command decorators.
+
+    Failure modes this closes (all observed with AI-generated plugins):
+      - manifest declares a command with no matching handler → the command
+        registers on Discord, the bot auto-defers, no code ever answers, and
+        the invoker stares at an eternal "thinking…";
+      - a decorator name with uppercase → registration lowercases the name but
+        SDK dispatch is a case-sensitive exact match, so the handler is dead;
+      - reserved/duplicate/illegal names → the platform refuses the zip at
+        publish time, AFTER the dev already reviewed a green draft.
+    """
+    declared = manifest_dict.get("slash_commands")
+    if declared is None:
+        declared = []
+    if not isinstance(declared, list):
+        result.add(
+            "error", "command_defs_not_list",
+            "manifest.json field \"slash_commands\" must be a JSON array.",
+            path="manifest.json",
+        )
+        return
+
+    handler_names_raw: list[str] = []
+    for src in py_sources:
+        for m in _SLASH_CMD_RE.finditer(src):
+            handler_names_raw.append(m.group(1).decode("utf-8", errors="ignore").strip())
+    handler_names = {n.lower() for n in handler_names_raw if n}
+
+    # Handlers whose decorator name isn't lowercase are dead on arrival:
+    # Discord registers the lowercased name, the event delivers that lowercase
+    # name, and the SDK's dispatch filter compares case-sensitively.
+    for raw in sorted({n for n in handler_names_raw if n and n != n.lower()}):
+        result.add(
+            "error", "command_handler_not_lowercase",
+            f"@on_slash_command(\"{raw}\") will never run: Discord registers "
+            f"the command as \"/{raw.lower()}\" and dispatch matches the "
+            f"decorator name exactly.",
+            hint=f"Rename the decorator (and any matching manifest entry) to "
+                 f"\"{raw.lower()}\".",
+        )
+
+    reserved = _RESERVED_COMMAND_NAMES
+
+    declared_names: list[str] = []
+    seen: set[str] = set()
+    for c in declared:
+        if not isinstance(c, dict) or not str(c.get("name") or "").strip():
+            result.add(
+                "error", "command_def_malformed",
+                "manifest.json has a slash_commands entry with no \"name\".",
+                path="manifest.json",
+                hint='Each entry needs at least {"name": "...", "description": "..."}.',
+            )
+            continue
+        raw = str(c.get("name")).strip()
+        name = raw.lower()
+        declared_names.append(name)
+        if raw != name:
+            result.add(
+                "warning", "command_name_not_lowercase",
+                f"Command \"/{raw}\" will register as \"/{name}\" — Discord "
+                f"command names are lowercase.",
+                path="manifest.json",
+                hint=f"Use \"{name}\" in manifest.json and in the "
+                     f"@on_slash_command decorator so all three match.",
+            )
+        if not _CMD_NAME_RE.match(name) or re.search(r"\s", name):
+            result.add(
+                "error", "command_name_invalid",
+                f"\"/{name}\" is not a valid Discord command name.",
+                path="manifest.json",
+                hint="Command names must be 1-32 chars of lowercase letters, "
+                     "digits, - or _.",
+            )
+        if name in seen:
+            result.add(
+                "error", "command_name_duplicate",
+                f"Command \"/{name}\" is declared more than once in "
+                f"manifest.json.",
+                path="manifest.json",
+            )
+        seen.add(name)
+        _walk_command_options(result, name, c.get("options"))
+
+    # Reserved names block publish outright (artifact_store_put raises), so
+    # surface them here first — including handler-only names, which the
+    # publish step auto-merges into the manifest before its gate runs.
+    for name in sorted((set(declared_names) | handler_names) & reserved):
+        result.add(
+            "error", "command_name_reserved",
+            f"Command name \"/{name}\" is reserved by a built-in YourBot "
+            f"plugin and cannot be used by marketplace plugins.",
+            path="manifest.json",
+            hint="Pick a different name (e.g. a plugin-specific prefix) in "
+                 "manifest.json and the @on_slash_command decorator.",
+        )
+
+    # Handler-only names get auto-merged into the manifest at publish, where
+    # the gate applies the same shape rule — so an oversized decorator name
+    # must fail here too, not first at commit.
+    for name in sorted(handler_names - set(declared_names)):
+        if not _CMD_NAME_RE.match(name):
+            result.add(
+                "error", "command_name_invalid",
+                f"\"/{name}\" (from an @on_slash_command decorator) is not a "
+                f"valid Discord command name.",
+                hint="Command names must be 1-32 chars of lowercase letters, "
+                     "digits, - or _.",
+            )
+
+    # Declared-but-no-handler: the command WILL appear in Discord and WILL
+    # hang forever when invoked. Only enforceable when the scanner saw literal
+    # decorator names; a plugin registering handlers dynamically gets a
+    # warning instead of a hard block.
+    unhandled = [n for n in declared_names if n not in handler_names]
+    if unhandled and handler_names:
+        for name in unhandled:
+            result.add(
+                "error", "command_missing_handler",
+                f"Command \"/{name}\" is declared in manifest.json but no "
+                f"@on_slash_command(\"{name}\") handler exists in your code. "
+                f"It would appear in Discord and hang on \"thinking…\" forever.",
+                path="manifest.json",
+                hint="Add the handler, or remove the manifest entry. Decorator "
+                     "names must be literal strings — the scanner (and the "
+                     "publish-time auto-merge) cannot see names built from "
+                     "variables.",
+            )
+    elif unhandled and py_sources:
+        result.add(
+            "warning", "command_handlers_not_found",
+            "manifest.json declares slash commands but no literal "
+            "@on_slash_command decorators were found in your code, so the "
+            "names could not be verified against their handlers.",
+            hint="Use literal string names in @on_slash_command decorators so "
+                 "mismatches are caught before your users hit them.",
+        )
+
+    # Handler-but-not-declared: publish auto-adds it with an empty description
+    # and NO options — it works, but shows "No description" in Discord and its
+    # event["options"] is always empty. Worth declaring properly.
+    for name in sorted(handler_names - set(declared_names)):
+        if name in reserved:
+            continue  # already reported as reserved above
+        result.add(
+            "warning", "command_not_declared",
+            f"@on_slash_command(\"{name}\") has no manifest.json entry. It "
+            f"will register with no description and no options (so "
+            f"event[\"options\"] is always empty).",
+            path="manifest.json",
+            hint=f"Add {{\"name\": \"{name}\", \"description\": \"...\"}} (plus "
+                 f"its options) to slash_commands in manifest.json.",
+        )
 
 
 # ── Forbidden-pattern AST scan ─────────────────────────────────────────────

@@ -17,7 +17,7 @@ import threading
 import traceback as _traceback
 from typing import Any, Callable, Dict, List, Optional
 
-from ._transport import Transport
+from ._transport import Transport, set_current_event, reset_current_event
 from ._context import Context
 
 
@@ -419,7 +419,7 @@ class Plugin:
         # expecting a JSON-RPC response with the widget data.
         for method_name, handler_fn in self._dashboard_handlers.items():
             rpc_method = f"dashboard.{method_name}"
-            def make_dash_handler(fn):
+            def make_dash_handler(fn, mname):
                 def dash_handler(params: dict):
                     # Build a per-request context with the server ID from params
                     ctx = Context(
@@ -433,10 +433,13 @@ class Plugin:
                         result = fn(ctx, params)
                         return result  # Transport sends this as the response
                     except Exception as e:
-                        ctx.log(f"Dashboard handler error ({method_name}):\n{_traceback.format_exc()[:3900]}", level="error")
+                        # mname is bound as a factory arg, not closed over the loop
+                        # variable — otherwise every handler's error log would report
+                        # the last-registered method name, not the one that ran.
+                        ctx.log(f"Dashboard handler error ({mname}):\n{_traceback.format_exc()[:3900]}", level="error")
                         return {"error": str(e)}
                 return dash_handler
-            self._transport.register_handler(rpc_method, make_dash_handler(handler_fn))
+            self._transport.register_handler(rpc_method, make_dash_handler(handler_fn, method_name))
 
         # Fire on_ready handlers in a thread so boot doesn't block the read loop
         has_bg = self._ready_handlers or self._scheduled_tasks or self._cron_tasks
@@ -561,50 +564,65 @@ class Plugin:
         else:
             ctx = self._ctx
 
-        # In pool mode, on_ready handlers are skipped during _handle_boot
-        # (the boot-time ctx has no tenant). Fire them here — once per
-        # (worker, server) — synchronously before the event handler runs, so
-        # per-tenant init (schema bootstrap, KV defaults) completes before any
-        # SQL/KV call from the handler.
-        if self._pool_mode and self._ready_handlers:
-            srv_id = str(params.get("discord_srv_id") or "")
-            if srv_id and srv_id not in self._pool_ready_servers:
-                with self._pool_ready_lock:
-                    if srv_id not in self._pool_ready_servers:
-                        self._pool_ready_servers.add(srv_id)
-                        for fn in self._ready_handlers:
-                            try:
-                                fn(ctx)
-                            except Exception:
+        # C5: bind the runner-issued event_id (+ this event's server_id) as the
+        # current event correlator for the whole handler run. Every ctx.* RPC
+        # issued from on_ready/event handlers below flows through Transport.call,
+        # which stamps this event_id so the host resolves the RPC's tenant by the
+        # TRUSTED event_id — not "most recent context", which leaks across servers
+        # in pool mode. Reset in finally so the next event on this thread starts
+        # clean (and so background tasks, which never enter here, stay uncorrelated
+        # → host falls back to today's behavior).
+        _evt_token = set_current_event(
+            str(event_id) if event_id is not None else None,
+            str(params.get("discord_srv_id") or ""),
+        )
+        try:
+            # In pool mode, on_ready handlers are skipped during _handle_boot
+            # (the boot-time ctx has no tenant). Fire them here — once per
+            # (worker, server) — synchronously before the event handler runs, so
+            # per-tenant init (schema bootstrap, KV defaults) completes before any
+            # SQL/KV call from the handler.
+            if self._pool_mode and self._ready_handlers:
+                srv_id = str(params.get("discord_srv_id") or "")
+                if srv_id and srv_id not in self._pool_ready_servers:
+                    with self._pool_ready_lock:
+                        if srv_id not in self._pool_ready_servers:
+                            self._pool_ready_servers.add(srv_id)
+                            for fn in self._ready_handlers:
                                 try:
-                                    ctx.log(
-                                        f"on_ready error:\n{_traceback.format_exc()[:3900]}",
-                                        level="error",
-                                    )
+                                    fn(ctx)
                                 except Exception:
-                                    pass
+                                    try:
+                                        ctx.log(
+                                            f"on_ready error:\n{_traceback.format_exc()[:3900]}",
+                                            level="error",
+                                        )
+                                    except Exception:
+                                        pass
 
-        # Set interaction ID on context for interaction events
-        if event_type == "interaction_create" and event.get("interaction_id"):
-            ctx._current_interaction_id = event["interaction_id"]
-        else:
-            ctx._current_interaction_id = None
+            # Set interaction ID on context for interaction events
+            if event_type == "interaction_create" and event.get("interaction_id"):
+                ctx._current_interaction_id = event["interaction_id"]
+            else:
+                ctx._current_interaction_id = None
 
-        # F35: track whether all handlers succeeded
-        all_ok = True
-        handlers = self._event_handlers.get(event_type, [])
-        for fn in handlers:
-            try:
-                fn(ctx, event)
-            except Exception as e:
-                all_ok = False
+            # F35: track whether all handlers succeeded
+            all_ok = True
+            handlers = self._event_handlers.get(event_type, [])
+            for fn in handlers:
                 try:
-                    ctx.log(
-                        f"Event handler error ({event_type}):\n{_traceback.format_exc()[:3900]}",
-                        level="error",
-                    )
-                except Exception:
-                    pass
+                    fn(ctx, event)
+                except Exception as e:
+                    all_ok = False
+                    try:
+                        ctx.log(
+                            f"Event handler error ({event_type}):\n{_traceback.format_exc()[:3900]}",
+                            level="error",
+                        )
+                    except Exception:
+                        pass
+        finally:
+            reset_current_event(_evt_token)
 
         # Always ACK the event to prevent retry→DLQ loops.  Infrastructure
         # errors (DB FK violations, Discord 404s) are deterministic — retrying
