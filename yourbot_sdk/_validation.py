@@ -100,6 +100,12 @@ _CAP_PATTERNS: list[tuple[bytes, str]] = [
     (b".kv.set(",          "storage:kv"),
     (b".kv.delete(",       "storage:kv"),
     (b".kv.list(",         "storage:kv"),
+    (b".kv.increment(",    "storage:kv"),
+    (b".kv.get_many(",     "storage:kv"),
+    (b".kv.set_many(",     "storage:kv"),
+    (b".kv.list_values(",  "storage:kv"),
+    # Legacy names kept for old uploads; the SDK's real batch methods are
+    # get_many/set_many.
     (b".kv.mget(",         "storage:kv"),
     (b".kv.mput(",         "storage:kv"),
     # storage:sql — sandboxed SQL
@@ -128,6 +134,7 @@ _CAP_PATTERNS: list[tuple[bytes, str]] = [
     (b".create_channel(",  "discord:manage_channels"),
     (b".edit_channel(",    "discord:manage_channels"),
     (b".delete_channel(",  "discord:manage_channels"),
+    (b".create_thread(",   "discord:manage_channels"),
     # discord:moderate_members
     (b".timeout_member(",  "discord:moderate_members"),
     (b".timeout_bulk(",    "discord:moderate_members"),
@@ -480,6 +487,12 @@ def validate_artifact(
             except Exception:
                 continue
         _validate_slash_commands(result, manifest_dict, cmd_scan_sources)
+        # 5d. Cron schedule consistency — in production (pool mode) scheduled
+        # work fires ONLY from manifest "cron" entries; the SDK's own
+        # cron/schedule threads never start. Drift between the manifest and
+        # the @plugin.cron decorators means schedules that silently never
+        # run. Scans the same unfiltered .py set as the command scan.
+        _validate_cron_entries(result, manifest_dict, cmd_scan_sources)
 
     # 6. Forbidden patterns (would actually fail at sandbox runtime).
     for path in py_paths:
@@ -765,6 +778,193 @@ def _validate_slash_commands(
             path="manifest.json",
             hint=f"Add {{\"name\": \"{name}\", \"description\": \"...\"}} (plus "
                  f"its options) to slash_commands in manifest.json.",
+        )
+
+
+# ── Cron schedule consistency (vendored from plugin_validation.py) ─────────
+
+# Cap + floor for manifest-declared server-side cron schedules. The runner's
+# dispatcher enforces both at fire time too — the validator exists so the dev
+# finds out at build time, not by a schedule silently never firing.
+_CRON_MAX_ENTRIES = 5
+_CRON_MIN_INTERVAL_MIN = 5
+
+# @<ident>.cron("spec") decorator — captures (spec, task_fn_name). Tolerates a
+# trailing comment after the decorator and further stacked decorators before
+# the def.
+_CRON_TASK_RE = re.compile(
+    rb"@\w+\.cron\s*\(\s*[\"']([^\"']*)[\"']\s*\)[^\r\n]*\r?\n"
+    rb"(?:\s*@[^\r\n]*\r?\n)*"
+    rb"\s*def\s+(\w+)"
+)
+# Any @<ident>.schedule( decorator — interval tasks are not cron-addressable.
+_SCHEDULE_TASK_RE = re.compile(rb"@\w+\.schedule\s*\(")
+
+
+def _cron_parse(spec: str) -> dict:
+    """Parse a five-field cron spec (delegates to the SDK's own parser, which
+    is semantics- and message-identical to the platform's shared matcher at
+    ``mmo_maid/core/cron_match.py``)."""
+    from ._plugin import _parse_cron_spec
+    return _parse_cron_spec(spec)
+
+
+def _cron_min_interval(parsed: dict) -> int:
+    """Lower bound (minutes) between two consecutive firings of the spec.
+
+    Vendored from ``mmo_maid/core/cron_match.py`` ``min_interval_minutes`` —
+    keep byte-for-byte identical behavior.
+    """
+    minutes = sorted(parsed["minute"])
+    if len(minutes) <= 1:
+        return 60
+    gaps = [b - a for a, b in zip(minutes, minutes[1:])]
+    gaps.append(60 - minutes[-1] + minutes[0])  # wrap into the next firing hour
+    return min(gaps)
+
+
+def _validate_cron_entries(
+    result: ValidationResult, manifest_dict: dict, py_sources: list[bytes],
+) -> None:
+    """Cross-check manifest ``cron`` entries against @plugin.cron decorators.
+
+    In production, marketplace plugins run in pool mode where the SDK never
+    starts @plugin.cron / @plugin.schedule background threads. Scheduled work
+    fires ONLY via manifest ``"cron"`` entries — the platform delivers a
+    synthetic ``cron`` event to every enabled install on schedule and the SDK
+    routes it to the @plugin.cron task whose function name matches the entry's
+    ``name``. So: an entry without a matching task no-ops, and a task without
+    a matching entry never runs in production. Both are surfaced here.
+    """
+    declared = manifest_dict.get("cron")
+    if declared is None:
+        declared = []
+    if not isinstance(declared, list):
+        result.add(
+            "error", "cron_not_list",
+            "manifest.json field \"cron\" must be a JSON array.",
+            path="manifest.json",
+            hint='Use [{"spec": "0 9 * * *", "name": "daily_summary"}] format.',
+        )
+        return
+
+    if len(declared) > _CRON_MAX_ENTRIES:
+        result.add(
+            "error", "cron_too_many",
+            f"manifest.json declares {len(declared)} cron entries "
+            f"(max {_CRON_MAX_ENTRIES}).",
+            path="manifest.json",
+            hint="Consolidate related work into fewer scheduled tasks.",
+        )
+
+    declared_names: list[str] = []
+    seen: set[str] = set()
+    for c in declared:
+        if (not isinstance(c, dict)
+                or not str(c.get("spec") or "").strip()
+                or not str(c.get("name") or "").strip()):
+            result.add(
+                "error", "cron_entry_malformed",
+                "manifest.json has a cron entry without both \"spec\" and \"name\".",
+                path="manifest.json",
+                hint='Each entry needs {"spec": "0 9 * * *", "name": "daily_summary"} '
+                     "— name must equal the @plugin.cron function's name.",
+            )
+            continue
+        name = str(c.get("name")).strip()
+        spec = str(c.get("spec")).strip()
+        if not name.isidentifier():
+            result.add(
+                "error", "cron_name_invalid",
+                f"Cron entry name \"{name}\" is not a valid Python identifier.",
+                path="manifest.json",
+                hint="The name must match the @plugin.cron function's name exactly.",
+            )
+        if name in seen:
+            result.add(
+                "error", "cron_name_duplicate",
+                f"Cron entry name \"{name}\" is declared more than once in "
+                f"manifest.json.",
+                path="manifest.json",
+            )
+        seen.add(name)
+        declared_names.append(name)
+        try:
+            parsed = _cron_parse(spec)
+        except (ValueError, TypeError) as e:
+            result.add(
+                "error", "cron_spec_invalid",
+                f"Cron entry \"{name}\" has an invalid spec: {e}",
+                path="manifest.json",
+                hint='Five space-separated fields: "minute hour day month dow" '
+                     "(UTC, day-of-week 0=Sunday).",
+            )
+            continue
+        if _cron_min_interval(parsed) < _CRON_MIN_INTERVAL_MIN:
+            result.add(
+                "error", "cron_spec_too_frequent",
+                f"Cron entry \"{name}\" (\"{spec}\") can fire more often than "
+                f"every {_CRON_MIN_INTERVAL_MIN} minutes — the platform floor.",
+                path="manifest.json",
+                hint='Use "*/5 * * * *" or slower. For higher-frequency work, '
+                     "react to events instead of polling on a schedule.",
+            )
+
+    # Code scan: literal @plugin.cron / @plugin.schedule registrations.
+    task_names_raw: list[str] = []
+    schedule_found = False
+    for src in py_sources:
+        for m in _CRON_TASK_RE.finditer(src):
+            task_names_raw.append(m.group(2).decode("utf-8", errors="ignore").strip())
+        if not schedule_found and _SCHEDULE_TASK_RE.search(src):
+            schedule_found = True
+    task_names = {n for n in task_names_raw if n}
+
+    # @plugin.cron task with no manifest entry — dead code in production.
+    for name in sorted(task_names - set(declared_names)):
+        result.add(
+            "warning", "cron_task_not_in_manifest",
+            f"@plugin.cron task \"{name}\" has no matching manifest.json cron "
+            f"entry, so it will never run in production (pooled plugins only "
+            f"fire manifest-declared schedules).",
+            path="manifest.json",
+            hint=f'Add {{"spec": "<its cron spec>", "name": "{name}"}} to '
+                 '"cron" in manifest.json.',
+        )
+
+    # @plugin.schedule is never cron-addressable — it simply doesn't run.
+    if schedule_found:
+        result.add(
+            "warning", "schedule_task_never_runs",
+            "@plugin.schedule interval tasks do not run in production (pooled "
+            "plugins have no background threads) and cannot be addressed by "
+            "manifest cron entries.",
+            hint="Convert the task to @plugin.cron and add a matching "
+                 '"cron" entry to manifest.json.',
+        )
+
+    # Manifest entry with no matching decorated task — the schedule fires but
+    # (name-match failing) only runs a task whose raw spec matches exactly.
+    missing = [n for n in declared_names if n not in task_names]
+    if missing and task_names:
+        for name in missing:
+            result.add(
+                "warning", "cron_missing_task",
+                f"Cron entry \"{name}\" has no matching @plugin.cron function "
+                f"named \"{name}\" — the schedule will fire but only run a "
+                f"task whose spec matches exactly.",
+                path="manifest.json",
+                hint="Name the manifest entry after the decorated function, "
+                     "or rename the function to match.",
+            )
+    elif missing and py_sources:
+        result.add(
+            "warning", "cron_tasks_not_found",
+            "manifest.json declares cron entries but no literal @plugin.cron "
+            "decorators were found in your code, so the names could not be "
+            "verified against their tasks.",
+            hint="Use literal string specs in @plugin.cron decorators so "
+                 "mismatches are caught before the schedule silently no-ops.",
         )
 
 

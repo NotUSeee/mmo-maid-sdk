@@ -3,6 +3,39 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.4]
+
+### Added
+
+- **Server-side cron for pooled plugins.** `@plugin.cron` tasks now run in
+  production: declare each task in `manifest.json` —
+  `"cron": [{"spec": "0 9 * * *", "name": "daily_summary"}]` (`name` = the
+  decorated function's name) — and the platform fires the schedule
+  server-side, once per enabled server, delivering a normal plugin event with
+  `event_type: "cron"`. The SDK routes it to the matching `@plugin.cron`
+  function with a tenant-scoped `ctx` (same per-tenant Context and
+  `on_ready`-before-first-event guarantees as any event); you can also consume
+  the raw event with `@plugin.on_event("cron")`. Limits: max 5 entries,
+  nothing more often than every 5 minutes, at-most-once per
+  (server, schedule, minute), missed ticks not replayed.
+- **Cron consistency checks in `mmo validate`.** The manifest `"cron"` array
+  is validated (shape, entry cap, 5-minute frequency floor, identifier names,
+  duplicates, spec syntax — same 5-field UTC dialect as the decorator), and
+  drift between the manifest and your code is surfaced: a `@plugin.cron` task
+  with no manifest entry never runs in production (warning), and
+  `@plugin.schedule` tasks never run in production at all (warning).
+- The `cron` starter template (`yourbot new`) now ships a manifest with
+  matching `"cron"` entries.
+
+### Fixed
+
+- **Lifecycle hooks get a per-tenant context in pool mode.**
+  `@on_install` / `@on_enable` / `@on_disable` / `@on_uninstall` handlers now
+  receive a Context scoped to the server the signal is for (previously the
+  blank boot ctx in pool mode), and their RPCs carry the host-supplied
+  correlation id so tenant resolution is exact even after the install row is
+  gone.
+
 ## [0.8.3]
 
 ### Added

@@ -388,6 +388,10 @@ configured channel and increments a counter every 15 minutes.
 
 Cron specs are 5-field standard: "minute hour day month dow", UTC.
 See SDK docs for the full syntax.
+
+In production each task MUST also be declared in manifest.json's "cron"
+array ({{"spec": ..., "name": "<function name>"}}) - the platform fires the
+schedule server-side and routes it back to the matching function here.
 """
 from yourbot_sdk import Plugin, Context
 
@@ -446,6 +450,16 @@ _TEMPLATE_CRON_MANIFEST = '''\
     "discord:send_message",
     "interaction:respond",
     "storage:kv"
+  ],
+  "cron": [
+    {{
+      "spec": "0 9 * * *",
+      "name": "daily_summary"
+    }},
+    {{
+      "spec": "*/15 * * * *",
+      "name": "heartbeat"
+    }}
   ],
   "slash_commands": [
     {{

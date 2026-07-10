@@ -291,13 +291,19 @@ class Plugin:
                 ...
 
         Notes:
-          - Like ``@schedule``, this is a thread-based loop inside the worker
-            process; if the plugin is restarted between firings, the missed
-            tick is **not** replayed.
-          - Cron tasks do not run in pool mode (same constraint as
-            ``@schedule``) because pool workers don't carry per-install ctx.
-            For pooled plugins, use the server-side cron registered in your
-            manifest (see PLUGIN_DEV.md).
+          - In single-tenant mode this is a thread-based loop inside the
+            worker process (like ``@schedule``); if the plugin is restarted
+            between firings, the missed tick is **not** replayed.
+          - In pool mode (all marketplace installs) the thread loop never
+            starts. Instead, declare the schedule in manifest.json::
+
+                "cron": [{"spec": "0 9 * * *", "name": "weekly_report"}]
+
+            (``name`` = this function's name). The platform fires it
+            server-side once per enabled server and the SDK routes each
+            firing back to this function with a tenant-scoped ctx.
+            Missed firings are not replayed; delivery is at-most-once per
+            (server, schedule, minute).
           - Invalid specs raise ``ValueError`` immediately at registration —
             you'll see the error during boot, not silently at the first miss.
         """
@@ -393,6 +399,20 @@ class Plugin:
             capabilities=list(params.get("capabilities") or []),
             transport=self._transport,
         )
+
+        # Server-side cron (pool mode): pooled workers never start the
+        # @plugin.cron/@plugin.schedule background threads, so the platform
+        # fires manifest-declared schedules as synthetic events with
+        # event_type "cron" instead. Route those through the NORMAL event
+        # dispatch (per-tenant Context, on_ready-before-first-event, ack/fail
+        # semantics all apply) to the @plugin.cron task whose function name
+        # matches the payload's "name". Registered as a plain event handler so
+        # a plugin's own @plugin.on_event("cron") handlers keep working
+        # alongside it (open event vocabulary).
+        if self._pool_mode and self._cron_tasks:
+            self._event_handlers.setdefault("cron", []).append(
+                self._dispatch_cron_event
+            )
 
         # Register event routing now that we have context
         for event_type in self._event_handlers:
@@ -513,20 +533,82 @@ class Plugin:
         t.start()
         self._scheduled_threads.append(t)
 
+    def _dispatch_cron_event(self, ctx, event: dict) -> None:
+        """Route a server-fired ``cron`` event to the matching @plugin.cron task.
+
+        The platform's dispatcher fires manifest-declared schedules as events
+        whose payload carries the entry's ``name`` (the decorated function's
+        name) and raw ``spec``. Name match wins; when no task name matches
+        (e.g. the manifest entry was renamed), tasks whose registered raw spec
+        equals the payload's spec run as a fallback. Cron tasks take (ctx)
+        only — the per-tenant ctx built by _dispatch_event.
+
+        Exceptions propagate to _dispatch_event so the normal failure path
+        (event.fail notification → circuit breaker) applies.
+        """
+        name = str((event or {}).get("name") or "")
+        spec = str((event or {}).get("spec") or "")
+        tasks = [t for t in self._cron_tasks
+                 if name and getattr(t[0], "__name__", "") == name]
+        if not tasks and spec:
+            tasks = [t for t in self._cron_tasks if t[2] == spec]
+        for fn, _parsed, _raw in tasks:
+            fn(ctx)
+
     def _handle_lifecycle(self, params: dict) -> None:
-        """Handle host.install, host.enable, host.disable, host.uninstall."""
+        """Handle host.install, host.enable, host.disable, host.uninstall.
+
+        Tenant fix: the boot-time ctx has server_id="" in pool mode, so a
+        lifecycle signal must build a per-tenant Context from the params'
+        ``discord_srv_id`` (mirrors the dashboard-handler per-request ctx) —
+        otherwise ctx.kv/sql/discord calls inside the handler resolve to no
+        tenant at all. Falls back to the boot ctx only when the host sent no
+        server id (legacy hosts / single-tenant mode where the boot ctx is
+        already tenant-scoped).
+
+        Correlation: when the host supplies ``_event_id`` (the runner pins a
+        tenant context snapshot under that id before signalling), bind it as
+        the current-event correlator for the whole handler run — exactly like
+        _dispatch_event — so every ctx RPC issued from the handler carries
+        ``_event_id`` and the host resolves the RIGHT tenant even after the
+        install row is gone (uninstall) or flipped (disable).
+
+        Handler exceptions are ctx.log'd, never raised — lifecycle signals are
+        advisory (at-most-once, best-effort); on_ready lazy-init remains the
+        guaranteed initialization path.
+        """
         if self._ctx is None:
             return
         lifecycle_type = str(params.get("lifecycle") or params.get("type") or "")
         handler = self._lifecycle_handlers.get(lifecycle_type)
-        if handler:
+        if not handler:
+            return
+
+        srv_id = str(params.get("discord_srv_id") or "")
+        if srv_id:
+            ctx = Context(
+                server_id=srv_id,
+                plugin_id=str(params.get("plugin_id") or self._ctx.plugin_id),
+                version=str(self._ctx.version),
+                capabilities=list(self._ctx.capabilities),
+                transport=self._transport,
+            )
+        else:
+            ctx = self._ctx
+
+        _event_id = params.get("_event_id")
+        _evt_token = set_current_event(
+            str(_event_id) if _event_id else None, srv_id,
+        )
+        try:
+            handler(ctx)
+        except Exception:
             try:
-                handler(self._ctx)
-            except Exception as e:
-                try:
-                    self._ctx.log(f"Lifecycle handler error ({lifecycle_type}):\n{_traceback.format_exc()[:3900]}", level="error")
-                except Exception:
-                    pass
+                ctx.log(f"Lifecycle handler error ({lifecycle_type}):\n{_traceback.format_exc()[:3900]}", level="error")
+            except Exception:
+                pass
+        finally:
+            reset_current_event(_evt_token)
 
     def _handle_shutdown(self, params: dict) -> None:
         self._stop_event.set()  # Signal scheduled tasks to stop
