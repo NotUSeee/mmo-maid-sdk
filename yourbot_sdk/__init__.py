@@ -52,6 +52,7 @@ from ._exceptions import (
     PermissionError,      # alias for SdkPermissionError (backwards compat)
     ValidationError,
     KvQuotaError,
+    RpcError,
     RpcTimeoutError,
     TimeoutError,         # alias for RpcTimeoutError (backwards compat)
 )
@@ -74,6 +75,7 @@ __all__ = [
     "PermissionError",       # alias
     "ValidationError",
     "KvQuotaError",
+    "RpcError",
     "RpcTimeoutError",
     "TimeoutError",          # alias
     "ActionRow",
@@ -82,4 +84,4 @@ __all__ = [
     "SelectOption",
     "TextInput",
 ]
-__version__ = "0.8.4"
+__version__ = "0.8.5"

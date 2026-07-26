@@ -549,11 +549,12 @@ _VALID_OPTION_TYPES = set(range(1, 12))
 # — a CI parity test on the platform side keeps this set in sync.
 _RESERVED_COMMAND_NAMES = {
     "announce", "appeal", "ban", "beacon", "case", "giveaway", "group",
-    "group-admin", "group-alerts", "history", "kick", "leaderboard",
-    "lockdown", "maid-bug-report", "music", "note", "poll", "purge",
+    "group-admin", "group-alerts", "help", "history", "kick", "leaderboard",
+    "lockdown", "maid-bug-report", "music", "note", "pluginbugreport",
+    "poll", "purge",
     "quarantine", "quests", "raidmode", "report", "slowmode", "stats",
     "temp-role", "ticket", "tickets", "timeout", "unban", "unlockdown",
-    "unquarantine", "untimeout", "warn", "welcome",
+    "unquarantine", "untimeout", "warn", "welcome", "yourbot",
 }
 
 

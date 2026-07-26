@@ -36,7 +36,7 @@ _warnings.warn(
 # (nested ``yourbot_sdk.yourbot_sdk.<name>``).
 _SUBMODULES = (
     "_plugin", "_context", "_transport", "_components", "_exceptions",
-    "_validation", "events", "dashboard", "testing", "cli",
+    "_validation", "events", "responses", "dashboard", "testing", "cli",
 )
 for _name in _SUBMODULES:
     try:

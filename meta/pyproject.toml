@@ -14,12 +14,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mmo-maid-sdk"
-version = "0.8.3"
+version = "0.8.5"
 description = "Deprecated alias for yourbot-sdk. Installs the YourBot SDK."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-dependencies = ["yourbot-sdk==0.8.3"]
+dependencies = ["yourbot-sdk==0.8.5"]
 classifiers = [
     "Development Status :: 7 - Inactive",
     "Intended Audience :: Developers",
@@ -28,7 +28,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://yourbot.gg/dev"
+Homepage = "https://yourbot.gg"
+Documentation = "https://yourbot.gg/docs/developers"
 Repository = "https://github.com/NotUSeee/yourbot-sdk"
 
 # No packages — this distribution is purely an install-name redirect.

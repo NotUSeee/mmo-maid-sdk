@@ -49,7 +49,7 @@ Local development:
     pip install yourbot-sdk              # from PyPI
     yourbot dev                                # run against a mock host
 
-Docs: https://yourbot.gg/dev/docs
+Docs: https://yourbot.gg/docs/developers
 """
 from yourbot_sdk import Plugin, Context
 from yourbot_sdk.events import MessageCreate

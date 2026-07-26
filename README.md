@@ -49,8 +49,8 @@ yourbot dev               # run your plugin locally against a mock host
 
 Full plugin contract, capability reference, and publishing guide:
 
-- **Docs:** https://yourbot.gg/dev/docs
-- **Developer Portal:** https://yourbot.gg/dev
+- **Docs:** https://yourbot.gg/docs/developers
+- **Developer Portal:** https://yourbot.gg/dev (sign-in required)
 
 ## License
 

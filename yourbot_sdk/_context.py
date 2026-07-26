@@ -1220,8 +1220,9 @@ class _MetricsApi:
         """Record a data point.
 
         Args:
-            metric: Metric name — must start with a letter, may contain
-                [a-zA-Z0-9_.], max 128 chars.
+            metric: Metric name — 1-64 chars, must start with a letter or
+                underscore, may contain only letters, digits, and
+                underscores (no dots).
             value: Numeric value (default 1.0).
             tags: Optional key-value tags for grouping (max 10 tags).
 

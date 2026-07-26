@@ -172,10 +172,12 @@ class Transport:
         F34: checks evt.wait() return value and raises TimeoutError on timeout
              instead of silently returning None.  Always cleans up _pending.
 
-        Raises TimeoutError on 30s timeout, RuntimeError on RPC error,
-        CapabilityError on capability denial.
+        Raises RpcTimeoutError on 30s timeout and a typed SdkError subclass on
+        RPC error (CapabilityError on capability denial, ...; RpcError — which
+        also subclasses RuntimeError — when the error maps to nothing more
+        specific).
         """
-        from ._exceptions import CapabilityError, RpcTimeoutError
+        from ._exceptions import CapabilityError, RpcError, RpcTimeoutError
 
         rid = self._next_req_id()
         evt = threading.Event()
@@ -200,7 +202,15 @@ class Transport:
                 if _srv and "_pool_discord_srv_id" not in params:
                     params["_pool_discord_srv_id"] = _srv
 
-        self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        try:
+            self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        except Exception:
+            # A failed write (e.g. json.dumps TypeError on a non-serializable
+            # param) means no response will ever arrive — drop the pending
+            # entry instead of leaking it.
+            with self._state_lock:
+                self._pending.pop(rid, None)
+            raise
 
         fired = evt.wait(timeout=30)
 
@@ -251,6 +261,20 @@ class Transport:
                     return 60.0 if remaining <= 0 else float(max(1, int(60 / max(remaining, 1))))
                 return 5.0
 
+            def _perm_name() -> str:
+                # Populates SdkPermissionError.permission. The structured field
+                # from newer hosts wins; otherwise best-effort parse of the two
+                # host message shapes ("bot lacks X permission" and
+                # "missing permission: X"). Empty string when unknown.
+                _p = meta.get("permission")
+                if isinstance(_p, str) and _p:
+                    return _p
+                _pm = _re.search(r"lacks ([A-Za-z_ ]+?) permission", err)
+                if _pm:
+                    return _pm.group(1).strip()
+                _pm = _re.search(r"missing permission[:\s]+([A-Za-z_]+)", err, _re.IGNORECASE)
+                return _pm.group(1) if _pm else ""
+
             # ── Structured code wins over message heuristics ──────────────
             # Unknown codes deliberately fall through to the substring path so
             # a newer host can never regress an older mapping.
@@ -272,7 +296,7 @@ class Transport:
                     raise DiscordApiError(err, status_code=int(_m.group(1)) if _m else 0)
                 if _struct_code == "BOT_MISSING_PERMISSION":
                     from ._exceptions import SdkPermissionError
-                    raise SdkPermissionError(err)
+                    raise SdkPermissionError(err, permission=_perm_name())
                 if _struct_code == "VALIDATION_ERROR":
                     from ._exceptions import ValidationError
                     raise ValidationError(err)
@@ -303,11 +327,14 @@ class Transport:
                 raise DiscordApiError(err, status_code=code)
             if ("bot lacks" in err_lower) or ("missing permission" in err_lower) or ("lacks permission" in err_lower):
                 from ._exceptions import SdkPermissionError
-                raise SdkPermissionError(err)
+                raise SdkPermissionError(err, permission=_perm_name())
             if "required" in err_lower and ("must be" in err_lower or "invalid" in err_lower):
                 from ._exceptions import ValidationError
                 raise ValidationError(err)
-            raise RuntimeError(f"RPC error ({method}): {err}")
+            # RpcError subclasses both SdkError (so `except SdkError` is a true
+            # catch-all, as documented) and RuntimeError (what this raised
+            # historically).
+            raise RpcError(f"RPC error ({method}): {err}")
 
         return result
 
@@ -399,6 +426,9 @@ class Transport:
                             _ra = err.get("retry_after")
                             if isinstance(_ra, (int, float)) and not isinstance(_ra, bool) and _ra >= 0:
                                 _meta["retry_after"] = float(_ra)
+                            _p = err.get("permission")
+                            if isinstance(_p, str) and _p:
+                                _meta["permission"] = _p
                             if _meta:
                                 self._error_meta[msg_id] = _meta
                         else:

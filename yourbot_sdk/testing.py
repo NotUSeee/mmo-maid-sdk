@@ -416,7 +416,7 @@ class _MockHttp:
         """Configure a mock response for requests matching url_contains."""
         self._mock_responses[url_contains] = {"status": status, "body_bytes": body, "headers": headers or {}, "truncated": False}
 
-    def request(self, method: str, url: str, headers=None, body=None, params=None,
+    def request(self, method: str, url: str, *, headers=None, body=None, params=None,
                 secret_auth=None, auth=None) -> Dict[str, Any]:
         self.requests.append({"method": method, "url": url, "headers": headers, "body": body,
                               "params": params, "secret_auth": secret_auth, "auth": auth})
@@ -425,11 +425,14 @@ class _MockHttp:
                 return resp
         return {"status": 200, "body_bytes": "", "headers": {}, "truncated": False}
 
-    def get(self, url: str, headers=None, params=None, secret_auth=None, auth=None) -> Dict[str, Any]:
-        return self.request("GET", url, headers=headers, params=params, secret_auth=secret_auth, auth=auth)
+    # get/post mirror _HttpApi exactly: keyword-only options, no secret_auth/
+    # auth (production only accepts those on request()), and post() requires
+    # body — so a call that passes here cannot TypeError in production.
+    def get(self, url: str, *, headers=None, params=None) -> Dict[str, Any]:
+        return self.request("GET", url, headers=headers, params=params)
 
-    def post(self, url: str, body: str = "", headers=None, params=None, secret_auth=None, auth=None) -> Dict[str, Any]:
-        return self.request("POST", url, headers=headers, body=body, params=params, secret_auth=secret_auth, auth=auth)
+    def post(self, url: str, *, body: str, headers=None, params=None) -> Dict[str, Any]:
+        return self.request("POST", url, headers=headers, body=body, params=params)
 
 
 class _MockWs:
@@ -470,7 +473,11 @@ class _MockWs:
 
 
 class _MockInteraction:
-    """Records interaction responses for assertion."""
+    """Records interaction responses for assertion.
+
+    Signatures mirror the real _InteractionApi (keyword-only) so a handler
+    that passes under the mock cannot TypeError in production.
+    """
 
     def __init__(self) -> None:
         self.responses: List[Dict[str, Any]] = []
@@ -478,17 +485,17 @@ class _MockInteraction:
         self.followups: List[Dict[str, Any]] = []
         self.modals_sent: List[Dict[str, Any]] = []
 
-    def respond(self, content: str = "", embeds=None, components=None, ephemeral: bool = False, allowed_mentions=None, update_message: bool = False) -> None:
+    def respond(self, *, content: str = "", embeds=None, components=None, ephemeral: bool = False, allowed_mentions=None, update_message: bool = False) -> None:
         self.responses.append({
             "content": content, "embeds": embeds, "components": components,
             "ephemeral": ephemeral, "allowed_mentions": allowed_mentions,
             "update_message": update_message,
         })
 
-    def defer(self, ephemeral: bool = False) -> None:
+    def defer(self, *, ephemeral: bool = False) -> None:
         self.defers.append({"ephemeral": ephemeral})
 
-    def followup(self, content: str = "", embeds=None, components=None, ephemeral: bool = False, allowed_mentions=None) -> Dict[str, Any]:
+    def followup(self, *, content: str = "", embeds=None, components=None, ephemeral: bool = False, allowed_mentions=None) -> Dict[str, Any]:
         msg_id = str(len(self.followups) + 1)
         self.followups.append({
             "content": content, "embeds": embeds, "components": components,
@@ -497,7 +504,7 @@ class _MockInteraction:
         })
         return {"message_id": msg_id, "channel_id": ""}
 
-    def send_modal(self, title: str, custom_id: str, fields=None) -> None:
+    def send_modal(self, *, title: str, custom_id: str, fields=None) -> None:
         self.modals_sent.append({"title": title, "custom_id": custom_id, "fields": fields})
 
 
@@ -527,7 +534,7 @@ class _MockSql:
         self.executed.append({"sql": sql, "params": params})
         return 0
 
-    def query(self, sql: str, params: Optional[list] = None, limit: int = 1000) -> List[Dict[str, Any]]:
+    def query(self, sql: str, params: Optional[list] = None, *, limit: int = 1000) -> List[Dict[str, Any]]:
         self.executed.append({"sql": sql, "params": params, "limit": limit})
         return []
 
@@ -746,7 +753,7 @@ class MockContext:
         """Mirror of Context.request_id (added in SDK 0.5.3)."""
         return self._current_interaction_id or ""
 
-    def log(self, message: str, level: str = "info", tags: Optional[List[str]] = None, **extra) -> None:
+    def log(self, message: str, *, level: str = "info", tags: Optional[List[str]] = None, **extra) -> None:
         self.log_entries.append({"message": message, "level": level, "tags": tags or [], **extra})
 
     def has_capability(self, cap: str) -> bool:

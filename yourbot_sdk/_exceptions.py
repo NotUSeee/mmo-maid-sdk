@@ -92,6 +92,17 @@ class KvQuotaError(SdkError):
     code = "KV_QUOTA_EXCEEDED"
 
 
+class RpcError(SdkError, RuntimeError):
+    """Raised when the host returns an error the SDK cannot map to a more
+    specific exception type.
+
+    Also subclasses RuntimeError because unmapped host errors were raised as
+    bare ``RuntimeError`` in earlier releases — existing
+    ``except RuntimeError`` handlers keep working.
+    """
+    code = "RPC_ERROR"
+
+
 class RpcTimeoutError(SdkError):
     """Raised when an RPC call times out."""
     code = "RPC_TIMEOUT"

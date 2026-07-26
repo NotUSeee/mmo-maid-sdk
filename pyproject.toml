@@ -23,8 +23,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://yourbot.gg/dev"
-Documentation = "https://yourbot.gg/dev/docs"
+Homepage = "https://yourbot.gg"
+Documentation = "https://yourbot.gg/docs/developers"
 Repository = "https://github.com/NotUSeee/yourbot-sdk"
 Issues = "https://github.com/NotUSeee/yourbot-sdk/issues"
 

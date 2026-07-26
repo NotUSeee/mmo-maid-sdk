@@ -3,6 +3,62 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.5]
+
+### Added
+
+- **`RpcError`.** Host errors the SDK cannot map to a more specific exception
+  (including "transport closed" failures) are now raised as
+  `yourbot_sdk.RpcError` instead of bare `RuntimeError`, so `except SdkError`
+  is a true catch-all as documented. `RpcError` also subclasses
+  `RuntimeError`, so existing `except RuntimeError` handlers keep working
+  unchanged. Note: code with BOTH an `except SdkError:` and an
+  `except RuntimeError:` clause will now route these errors into whichever
+  clause appears first — previously they could only match `RuntimeError`.
+- **`SdkPermissionError.permission` is now populated.** Newer hosts ship the
+  missing permission name in the structured error payload; against older
+  hosts the SDK best-effort parses it from the error message. Empty string
+  when unknown (previously it was always empty).
+
+### Fixed
+
+- **Reserved command names resynced with the platform.** `yourbot validate` now
+  refuses the platform commands `help` and `yourbot` locally, matching the
+  publish gate (previously the platform rejected `yourbot` at publish while
+  local validation passed it, and `help` is newly reserved for the platform's
+  `/help` command).
+- **`yourbot_sdk.responses` importable through every shim.** The `responses`
+  module (typed return shapes) was missing from the compat-shim submodule
+  lists, so `from mmo_maid_sdk.responses import Member` (and the monorepo
+  dev-tree import) failed with `ModuleNotFoundError` even though the module
+  ships in the wheel.
+- **`ctx.metrics.record` documents the enforced name rule.** The docstring
+  claimed names up to 128 chars with dots; the platform actually enforces
+  1-64 chars of `[a-zA-Z_][a-zA-Z0-9_]*` (no dots). Dotted names now also
+  fail fast at the RPC layer with a clear message instead of a generic
+  storage error.
+- **No more leaked pending entries on a failed request write.** If
+  serializing an RPC request failed (e.g. a non-JSON-serializable param), the
+  request stayed in the pending table forever; it is now cleaned up and the
+  original exception propagates unchanged.
+
+### Changed
+
+- **Testing mocks enforce production signatures.** `MockContext` sub-APIs now
+  reject positional arguments exactly where production does:
+  `ctx.interaction.respond/defer/followup/send_modal`, `ctx.http.request`
+  options, `ctx.log` options, and `ctx.sql.query`'s `limit` are keyword-only;
+  `ctx.http.get/post` no longer accept `secret_auth`/`auth` (production only
+  accepts those on `ctx.http.request`), and `ctx.http.post` requires `body`.
+  Tests that passed these positionally were already broken in production —
+  the mock now catches it before you ship.
+- **Reserved names are grandfathered on the platform.** If your plugin
+  published a command before its name became reserved, the platform keeps
+  accepting your uploads and registers the command on each server under the
+  alias `/yourpluginid-name`; events still arrive under your manifest name.
+  Local `yourbot validate` cannot see your publish history, so it may still flag
+  such a name as reserved — the platform's publish gate is the authority.
+
 ## [0.8.4]
 
 ### Added
@@ -18,7 +74,7 @@ All notable changes to the YourBot SDK are documented here. This project follows
   the raw event with `@plugin.on_event("cron")`. Limits: max 5 entries,
   nothing more often than every 5 minutes, at-most-once per
   (server, schedule, minute), missed ticks not replayed.
-- **Cron consistency checks in `mmo validate`.** The manifest `"cron"` array
+- **Cron consistency checks in `yourbot validate`.** The manifest `"cron"` array
   is validated (shape, entry cap, 5-minute frequency floor, identifier names,
   duplicates, spec syntax — same 5-field UTC dialect as the decorator), and
   drift between the manifest and your code is surfaced: a `@plugin.cron` task
@@ -40,7 +96,7 @@ All notable changes to the YourBot SDK are documented here. This project follows
 
 ### Added
 
-- **Slash-command consistency checks in `mmo validate`.** The local validator
+- **Slash-command consistency checks in `yourbot validate`.** The local validator
   now cross-checks `manifest.json` `slash_commands` against your
   `@plugin.on_slash_command` decorators, exactly like the platform does at
   upload and in the Plugin Builder preview: a declared command with no matching
@@ -52,7 +108,7 @@ All notable changes to the YourBot SDK are documented here. This project follows
   `type`. A handler with no manifest entry warns (it registers with no
   description and no options). Fix mismatches locally instead of discovering
   them after a failed upload.
-- **`proxy:websocket` capability detection.** `mmo validate` and capability
+- **`proxy:websocket` capability detection.** `yourbot validate` and capability
   auto-detection now recognize `ctx.ws.*` usage, so WebSocket plugins no longer
   validate green locally while missing the capability at upload.
 
