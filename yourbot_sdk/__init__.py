@@ -42,7 +42,7 @@ recovery so you don't have to.
 """
 
 from ._plugin import Plugin
-from ._context import Context
+from ._context import Context, QueryResult
 from ._exceptions import (
     SdkError,
     CapabilityError,
@@ -67,6 +67,7 @@ from ._components import (
 __all__ = [
     "Plugin",
     "Context",
+    "QueryResult",
     "SdkError",
     "CapabilityError",
     "RateLimitError",
@@ -84,4 +85,4 @@ __all__ = [
     "SelectOption",
     "TextInput",
 ]
-__version__ = "0.8.5"
+__version__ = "0.9.0"

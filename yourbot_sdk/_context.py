@@ -50,6 +50,23 @@ if TYPE_CHECKING:
     from .responses import Member, Role, Channel, Guild, Message
 
 
+class QueryResult(List[Dict[str, Any]]):
+    """The rows returned by :meth:`ctx.sql.query`, plus a ``truncated`` flag.
+
+    This IS a list — iterate it, index it, ``len()`` it, compare it to a plain
+    list. The only addition is ``.truncated``, which is True when the host
+    clipped the result at the requested ``limit``. The host has always computed
+    that flag; before this type existed the SDK dropped it, so a query that lost
+    rows looked identical to one that did not.
+    """
+
+    __slots__ = ("truncated",)
+
+    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None, *, truncated: bool = False):
+        super().__init__(rows or [])
+        self.truncated = bool(truncated)
+
+
 class _SecretsApi:
     """ctx.secrets — encrypted per-plugin secrets (requires storage:secrets capability).
 
@@ -163,9 +180,33 @@ class _KvApi:
             return result.get("value")
         return result
 
-    def list(self, prefix: str = "", limit: int = 100) -> List[str]:
-        """List stored key names, optionally filtered by prefix.  Up to 1000 results."""
-        result = self._t.call("kv.list", {"prefix": prefix, "limit": limit})
+    def list(self, prefix: str = "", limit: int = 100, *, start_after: str = "") -> List[str]:
+        """List stored key names, optionally filtered by prefix.
+
+        The host caps this at **100 keys per call** — a larger ``limit`` is
+        silently clamped, not an error. To walk more than 100 keys, page with
+        ``start_after``: pass the last key you received to get the next page.
+        Keys come back in ascending order.
+
+        Args:
+            prefix: Only return keys starting with this string.
+            limit: Max keys to return (1-100, default 100).
+            start_after: Resume after this key (exclusive). Empty = from the start.
+
+        Example::
+            cursor = ""
+            while True:
+                page = ctx.kv.list(prefix="user:", start_after=cursor)
+                if not page:
+                    break
+                for key in page:
+                    ...
+                cursor = page[-1]
+        """
+        payload: Dict[str, Any] = {"prefix": prefix, "limit": min(int(limit), 100)}
+        if start_after:
+            payload["start_after"] = str(start_after)
+        result = self._t.call("kv.list", payload)
         if isinstance(result, dict):
             return result.get("keys") or []
         return []
@@ -231,6 +272,7 @@ class _DiscordApi:
         embeds: Optional[List[Dict[str, Any]]] = None,
         components: Optional[list] = None,
         files: Optional[List[Dict[str, str]]] = None,
+        allowed_mentions: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Send a message.  Returns dict with 'message_id' and 'channel_id'.
 
@@ -244,6 +286,11 @@ class _DiscordApi:
                 - ``filename``: Display name (e.g. ``"chart.png"``)
                 - ``data_b64``: Base64-encoded file content
                 Max 3 files, 8 MB total.
+            allowed_mentions: Discord allowed_mentions object controlling which
+                mentions in ``content`` actually ping. Omit and NOTHING pings
+                (the host defaults to ``{"parse": []}``). The host sanitizes
+                whatever you pass and always strips ``everyone``/``here``, so
+                those can never be triggered from a plugin.
 
         Example::
 
@@ -265,6 +312,8 @@ class _DiscordApi:
             params["components"] = [c.to_dict() if hasattr(c, "to_dict") else c for c in components]
         if files:
             params["files"] = files[:3]
+        if allowed_mentions is not None:
+            params["allowed_mentions"] = allowed_mentions
         result = self._t.call("discord.send_message", params)
         return result if isinstance(result, dict) else {}
 
@@ -276,6 +325,7 @@ class _DiscordApi:
         content: Optional[str] = None,
         embeds: Optional[List[Dict[str, Any]]] = None,
         components: Optional[list] = None,
+        allowed_mentions: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Edit an existing message.  Only bot-owned messages can be edited.
 
@@ -286,6 +336,9 @@ class _DiscordApi:
           - ``content=""`` — clear text
           - ``embeds=[]`` — clear all embeds
           - ``components=[]`` — clear all buttons / select menus
+
+        ``allowed_mentions`` follows the same policy as ``send_message``: omit
+        it and nothing pings, and the host always strips ``everyone``/``here``.
         """
         params: Dict[str, Any] = {
             "channel_id": str(channel_id),
@@ -299,6 +352,8 @@ class _DiscordApi:
             params["components"] = [
                 c.to_dict() if hasattr(c, "to_dict") else c for c in components
             ]
+        if allowed_mentions is not None:
+            params["allowed_mentions"] = allowed_mentions
         result = self._t.call("discord.edit_message", params)
         return result if isinstance(result, dict) else {}
 
@@ -1304,8 +1359,13 @@ class _SqlApi:
             return int(result.get("rowcount", 0))
         return 0
 
-    def query(self, sql: str, params: Optional[list] = None, *, limit: int = 1000) -> List[Dict[str, Any]]:
+    def query(self, sql: str, params: Optional[list] = None, *, limit: int = 1000) -> "QueryResult":
         """Run a SELECT query. Returns list of dicts, max 1000 rows.
+
+        The return value is a plain list of row dicts that also carries a
+        ``.truncated`` flag, True when the host clipped the result at ``limit``.
+        Check it before treating a result as complete — clipping is otherwise
+        invisible.
 
         Args:
             sql: SELECT statement with %s placeholders.
@@ -1318,13 +1378,15 @@ class _SqlApi:
             )
             for row in rows:
                 print(row["user_id"], row["messages"])
+            if rows.truncated:
+                ctx.log("warn", "result clipped — narrow the query or page with OFFSET")
         """
         result = self._t.call("sql.query", {
             "sql": str(sql), "params": list(params or []), "limit": min(int(limit), 1000),
         })
         if isinstance(result, dict):
-            return result.get("rows") or []
-        return []
+            return QueryResult(result.get("rows") or [], truncated=bool(result.get("truncated")))
+        return QueryResult([])
 
     def query_one(self, sql: str, params: Optional[list] = None) -> Optional[Dict[str, Any]]:
         """Run a SELECT and return the first row only (or None).

@@ -23,6 +23,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from ._context import QueryResult
 from ._exceptions import CapabilityError
 
 
@@ -133,10 +134,15 @@ class _MockKv:
             self._ttls.pop(key, None)
             self.writes.append({"op": "delete", "key": key})
 
-    def list(self, prefix: str = "", limit: int = 100) -> List[str]:
+    def list(self, prefix: str = "", limit: int = 100, *, start_after: str = "") -> List[str]:
         with self._lock:
             keys = sorted(k for k in self._store if k.startswith(prefix) and not self._is_expired(k))
-            return keys[:limit]
+            if start_after:
+                keys = [k for k in keys if k > start_after]
+            # The host clamps to 100 no matter what is asked for; mirror that so a
+            # plugin that only works because the mock returned more than 100 keys
+            # fails in tests rather than in production.
+            return keys[:min(int(limit), 100)]
 
     def get_many(self, keys: List[str]) -> Dict[str, Any]:
         with self._lock:
@@ -233,15 +239,16 @@ class _MockDiscord:
         """
         self._message_store = sorted(messages, key=lambda m: int(m["id"]))
 
-    def send_message(self, *, channel_id: str, content: str = "", embeds=None, components=None, files=None) -> Dict[str, Any]:
-        msg = {"channel_id": channel_id, "content": content, "embeds": embeds, "components": components, "files": files, "message_id": str(len(self.messages_sent) + 1)}
+    def send_message(self, *, channel_id: str, content: str = "", embeds=None, components=None, files=None, allowed_mentions=None) -> Dict[str, Any]:
+        msg = {"channel_id": channel_id, "content": content, "embeds": embeds, "components": components, "files": files, "allowed_mentions": allowed_mentions, "message_id": str(len(self.messages_sent) + 1)}
         self.messages_sent.append(msg)
         return {"ok": True, "message_id": msg["message_id"], "channel_id": channel_id}
 
-    def edit_message(self, *, channel_id: str, message_id: str, content=None, embeds=None, components=None) -> Dict[str, Any]:
+    def edit_message(self, *, channel_id: str, message_id: str, content=None, embeds=None, components=None, allowed_mentions=None) -> Dict[str, Any]:
         self.messages_edited.append({
             "channel_id": channel_id, "message_id": message_id,
             "content": content, "embeds": embeds, "components": components,
+            "allowed_mentions": allowed_mentions,
         })
         return {"ok": True}
 
@@ -534,9 +541,10 @@ class _MockSql:
         self.executed.append({"sql": sql, "params": params})
         return 0
 
-    def query(self, sql: str, params: Optional[list] = None, *, limit: int = 1000) -> List[Dict[str, Any]]:
+    def query(self, sql: str, params: Optional[list] = None, *, limit: int = 1000) -> QueryResult:
         self.executed.append({"sql": sql, "params": params, "limit": limit})
-        return []
+        # Match the real API's return type so `rows.truncated` works under test.
+        return QueryResult([])
 
     def query_one(self, sql: str, params: Optional[list] = None) -> Optional[Dict[str, Any]]:
         self.executed.append({"sql": sql, "params": params})

@@ -2,21 +2,93 @@
 
 This module is a **vendored copy** of the validation logic the YourBot platform
 runs on a plugin artifact before accepting a version. Shipped in the SDK so devs
-can run the exact same checks locally with `mmo validate` instead of discovering
-errors only after a failed upload.
+can run the exact same checks locally with `yourbot validate` instead of
+discovering errors only after a failed upload.
 
-Contract: this file's output must match the platform's output byte-for-byte for
-the same input. A CI parity test on the platform side diffs this against the
-source-of-truth at `mmo_maid/core/plugin_validation.py` and the helpers at
-`mmo_maid/core/artifact_store.py` so drift is caught early.
+Contract: for the same artifact bytes this file must emit the SAME finding
+codes, with the SAME messages/hints, in the SAME order as the platform gate. A
+differential harness zips each plugin version and diffs the two finding
+sequences. It ships as a **hand-maintained** vendored copy — it is edited in
+place when the platform validator changes, because it cannot import any
+`mmo_maid.*` module (the platform does not exist inside the SDK wheel), so
+several platform helpers are inlined here rather than imported.
 
-Sources of truth:
-  - `mmo_maid/core/plugin_validation.py` — the validator itself
+Sources of truth (all inlined below, none importable at runtime):
+  - `mmo_maid/core/plugin_validation.py`  — the validator itself
   - `mmo_maid/core/artifact_store.py`     — `_detect_capabilities`,
     `manifest_capabilities`, `write_manifest_capabilities`,
-    `_CAP_PATTERNS`, `_CAPABILITIES_KEYS`
+    `_CAP_PATTERNS`, `_CAPABILITIES_KEYS`, `_SLASH_CMD_RE`
+  - `mmo_maid/core/command_registry.py`   — `reserved_command_names()`, frozen
+    into `_RESERVED_COMMAND_NAMES`
+  - `mmo_maid/core/dashboard_manifest.py` — `validate_dashboard_manifest`,
+    `iter_manifest_widgets`, `manifest_widget_rpc_names`,
+    `manifest_declared_rpc_names`
+  - `mmo_maid/core/api_sandbox.py`        — `_validate_plugin_sql` and its
+    helpers (`_strip_sql_comments`, `_assert_single_statement`,
+    `_mask_sql_string_literals`, `_SQL_ALLOWED_STATEMENTS`,
+    `_SQL_BLOCKED_PATTERNS`)
+  - `mmo_maid/core/cron_match.py`         — via the SDK's own `_parse_cron_spec`
 
-When upgrading, regenerate this file rather than editing it by hand.
+Checks this module runs (finding codes, in emission order):
+  1.  zip integrity ............ artifact_unreadable
+  2.  entry point .............. missing_entry_point
+  3.  manifest parse ........... missing_manifest, manifest_encoding,
+                                 manifest_not_object, manifest_invalid_json
+  4.  manifest fields .......... manifest_missing_field,
+                                 manifest_plugin_id_mismatch,
+                                 manifest_version_mismatch,
+                                 description_too_long, description_placeholder,
+                                 capabilities_not_list, capability_malformed
+  5.  capability cross-check ... capability_used_not_declared,
+                                 capability_declared_not_used
+  5b. bundled imports .......... import_not_bundled_or_declared
+      dashboard wiring ......... dashboard_handler_without_manifest,
+                                 dashboard_manifest_unparseable,
+                                 dashboard_manifest_invalid,
+                                 dashboard_rpc_method_missing_handler,
+                                 dashboard_declared_rpc_no_handler
+  5c. slash commands ........... command_defs_not_list,
+                                 command_handler_not_lowercase,
+                                 command_def_malformed,
+                                 command_name_not_lowercase,
+                                 command_name_invalid, command_name_duplicate,
+                                 command_options_not_list,
+                                 command_option_malformed,
+                                 command_option_missing_name,
+                                 command_option_name_invalid,
+                                 command_option_missing_type,
+                                 command_option_type_invalid,
+                                 command_name_reserved,
+                                 command_missing_handler,
+                                 command_handlers_not_found,
+                                 command_not_declared
+  5d. cron schedules ........... cron_not_list, cron_too_many,
+                                 cron_entry_malformed, cron_name_invalid,
+                                 cron_name_duplicate, cron_spec_invalid,
+                                 cron_spec_too_frequent,
+                                 cron_task_not_in_manifest,
+                                 schedule_task_never_runs, cron_missing_task,
+                                 cron_tasks_not_found
+  6.  per-file AST scans ....... syntax_error, forbidden_eval, forbidden_exec,
+                                 forbidden_compile, forbidden_dunder_import,
+                                 forbidden_import_subprocess,
+                                 forbidden_import_ctypes,
+                                 forbidden_import_socket,
+                                 forbidden_import_multiprocessing,
+                                 ctx_call_positional_kwonly,
+                                 ctx_call_unknown_kwarg,
+                                 ctx_call_missing_required,
+                                 plugin_sql_rejected
+  7.  junk files ............... bytecode_in_artifact, git_metadata_in_artifact
+
+Two checks depend on the environment rather than the artifact and disable
+themselves (emitting nothing) if their dependency is unavailable, exactly as
+the platform's do:
+  * the ctx call-signature lint introspects the installed SDK's own
+    ``_context`` module — if that import fails, the lint is skipped;
+  * the SQL dry-check runs the inlined sandbox validator with
+    ``active_schema=None``, so the cross-schema reference check (which needs a
+    live per-server schema name) never fires here — same as on the platform.
 """
 from __future__ import annotations
 
@@ -210,6 +282,836 @@ def _detect_capabilities_with_locations(
     )
 
 
+# ── Dashboard manifest schema (vendored from core/dashboard_manifest.py) ───
+#
+# The platform validator imports this module; the SDK cannot, so the schema is
+# inlined verbatim. Error strings are surfaced to the dev as
+# ``dashboard_manifest_invalid`` messages, so they must stay byte-identical.
+
+VALID_WIDGET_TYPES = {"stat_card", "chart", "table", "form", "text", "alert",
+                      "progress_bar", "list", "markdown"}
+# Canonical width set = union of the SDK builder's set and the customer
+# renderer's grid spans (quarter=3, third=4, half=6, two_thirds=8, full=12).
+VALID_WIDTHS = {"quarter", "third", "half", "two_thirds", "full"}
+
+# ── schema: 2 vocabulary ─────────────────────────────────────────────────────
+V2_WIDGET_TYPES = {"image", "key_value", "timeline", "badge_list", "user_list",
+                   "heading", "divider", "action_button"}
+V2_CONTAINER_TYPES = {"section", "tabs"}
+# Widget types that fetch data on page load (and therefore need rpc_method or
+# a v2 `source` binding). heading/divider/image are static; action_button only
+# fires on click; the rest render an empty state until data arrives but don't
+# REQUIRE a binding.
+_TYPES_REQUIRING_DATA = {"stat_card", "chart", "table"}
+_STATIC_TYPES = {"heading", "divider", "image", "action_button"}
+V2_ACTION_STYLES = {"default", "primary", "danger"}
+V2_COLUMN_FORMATS = {"badge", "timestamp", "number", "percent", "link",
+                     "avatar", "code"}
+V2_BADGE_COLOR_TOKENS = {"green", "red", "gold", "cyan", "gray"}
+V2_CHART_HEIGHTS = {"sm", "md", "lg"}
+V2_DENSITIES = {"cozy", "compact"}
+_PERMISSION_VALUES = {"viewer", "manager", "owner"}  # api_rbac._ROLE_ORDER keys
+_REFRESH_MIN, _REFRESH_MAX = 5, 3600
+
+_HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+# Handler names registered via @plugin.on_dashboard("<name>").
+_RPC_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def _is_safe_asset_path(path: object) -> bool:
+    """Zip-relative dashboard asset path: must live under dashboard/, no
+    traversal, no absolute paths, no backslashes."""
+    if not isinstance(path, str) or not path:
+        return False
+    if ".." in path or path.startswith(("/", "\\")) or "\\" in path:
+        return False
+    return path.startswith("dashboard/") and len(path) <= 200
+
+
+def _validate_rpc_block(manifest: dict, errors: list) -> None:
+    rpc = manifest.get("rpc")
+    if rpc is None:
+        return
+    if not isinstance(rpc, dict):
+        errors.append("'rpc' must be an object mapping method name -> {\"writes\": true|false}")
+        return
+    for name, spec in rpc.items():
+        if not isinstance(name, str) or not _RPC_NAME_RE.match(name):
+            errors.append(
+                f"'rpc' key {name!r} is not a valid method name "
+                "(letters, digits, _ or -, max 64 chars)")
+            continue
+        if not isinstance(spec, dict):
+            errors.append(f"'rpc.{name}' must be an object — use {{}} or {{\"writes\": true}}")
+            continue
+        writes = spec.get("writes")
+        if writes is not None and not isinstance(writes, bool):
+            errors.append(f"'rpc.{name}.writes' must be true or false")
+
+
+def _validate_theme(theme: object, errors: list) -> None:
+    if not isinstance(theme, dict):
+        errors.append("'theme' must be an object of brand tokens")
+        return
+    for key in ("accent", "accent_secondary"):
+        v = theme.get(key)
+        if v is not None and (not isinstance(v, str) or not _HEX_COLOR_RE.match(v)):
+            errors.append(f"'theme.{key}' must be a hex color like #7c5cff")
+    palette = theme.get("chart_palette")
+    if palette is not None:
+        if (not isinstance(palette, list) or not palette or len(palette) > 8
+                or not all(isinstance(c, str) and _HEX_COLOR_RE.match(c) for c in palette)):
+            errors.append("'theme.chart_palette' must be a list of 1-8 hex colors")
+    logo = theme.get("logo")
+    if logo is not None and not _is_safe_asset_path(logo):
+        errors.append("'theme.logo' must be a zip-relative path under dashboard/ (no traversal)")
+    header = theme.get("header")
+    if header is not None:
+        if not isinstance(header, dict):
+            errors.append("'theme.header' must be an object {title, subtitle}")
+        else:
+            for key in ("title", "subtitle"):
+                v = header.get(key)
+                if v is not None and (not isinstance(v, str) or len(v) > 120):
+                    errors.append(f"'theme.header.{key}' must be a string of at most 120 chars")
+    density = theme.get("density")
+    if density is not None and density not in V2_DENSITIES:
+        errors.append(f"'theme.density' must be one of {sorted(V2_DENSITIES)}")
+
+
+def _validate_refresh(value: object, where: str, errors: list) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) \
+            or not (_REFRESH_MIN <= value <= _REFRESH_MAX):
+        errors.append(f"{where}: 'refresh_seconds' must be an integer between "
+                      f"{_REFRESH_MIN} and {_REFRESH_MAX}")
+
+
+def _validate_permission(item: dict, where: str, errors: list) -> None:
+    perm = item.get("permission")
+    if perm is not None and (not isinstance(perm, str)
+                             or perm.strip().lower() not in _PERMISSION_VALUES):
+        errors.append(f"{where}: 'permission' must be one of {sorted(_PERMISSION_VALUES)}")
+
+
+def _validate_data_sources(page: dict, where: str, errors: list,
+                           seen_global: set | None = None) -> set:
+    """Validate page.data_sources; returns the set of declared source ids.
+
+    ``seen_global`` enforces MANIFEST-WIDE id uniqueness: the source endpoint
+    resolves a source id by scanning pages in order, so two pages declaring
+    the same id would silently shadow the later one."""
+    sources = page.get("data_sources")
+    ids: set = set()
+    if sources is None:
+        return ids
+    if not isinstance(sources, list):
+        errors.append(f"{where}: 'data_sources' must be a list")
+        return ids
+    for i, src in enumerate(sources):
+        w = f"{where} data_source {i}"
+        if not isinstance(src, dict):
+            errors.append(f"{w} must be an object")
+            continue
+        sid = src.get("id")
+        if not isinstance(sid, str) or not _ID_RE.match(sid):
+            errors.append(f"{w}: 'id' is required (letters, digits, _ or -, max 64)")
+        elif sid in ids or (seen_global is not None and sid in seen_global):
+            errors.append(f"{w}: duplicate data_source id '{sid}' "
+                          "(ids must be unique across the whole manifest)")
+        else:
+            ids.add(sid)
+            if seen_global is not None:
+                seen_global.add(sid)
+        m = src.get("rpc_method")
+        if not isinstance(m, str) or not _RPC_NAME_RE.match(m):
+            errors.append(f"{w}: 'rpc_method' is required")
+        params = src.get("rpc_params")
+        if params is not None and not isinstance(params, dict):
+            errors.append(f"{w}: 'rpc_params' must be an object")
+        _validate_refresh(src.get("refresh_seconds"), w, errors)
+    return ids
+
+
+def _validate_columns_v2(widget: dict, where: str, errors: list) -> None:
+    """v2 deep validation of table columns (v1 kept its shallow check)."""
+    for j, col in enumerate(widget.get("columns") or []):
+        w = f"{where} column {j}"
+        if isinstance(col, str):
+            continue
+        if not isinstance(col, dict):
+            errors.append(f"{w} must be a string key or an object")
+            continue
+        if not col.get("key"):
+            errors.append(f"{w}: missing 'key'")
+        fmt = col.get("format")
+        if fmt is not None:
+            if fmt not in V2_COLUMN_FORMATS:
+                errors.append(f"{w}: invalid format '{fmt}' (valid: {sorted(V2_COLUMN_FORMATS)})")
+            elif fmt == "badge":
+                colors = (col.get("format_options") or {}).get("colors") \
+                    if isinstance(col.get("format_options"), dict) else None
+                if colors is not None:
+                    if not isinstance(colors, dict) or not all(
+                            isinstance(k, str) and v in V2_BADGE_COLOR_TOKENS
+                            for k, v in colors.items()):
+                        errors.append(
+                            f"{w}: 'format_options.colors' must map values to one of "
+                            f"{sorted(V2_BADGE_COLOR_TOKENS)}")
+
+
+def _validate_plain_widget(widget: dict, where: str, schema: int,
+                           source_ids: set, errors: list) -> None:
+    """One non-container widget. v1 semantics are frozen; v2 adds vocabulary."""
+    wtype = widget.get("type", "")
+    valid_types = VALID_WIDGET_TYPES | (V2_WIDGET_TYPES if schema >= 2 else set())
+    if wtype not in valid_types:
+        if schema < 2 and wtype in (V2_WIDGET_TYPES | V2_CONTAINER_TYPES):
+            errors.append(f"{where}: widget type '{wtype}' requires \"schema\": 2")
+        else:
+            # Sorted, not the raw set: set repr order is not stable across
+            # processes, which made this message non-deterministic and broke
+            # byte-parity between this validator and its vendored twin.
+            errors.append(
+                f"{where}: invalid type '{wtype}' "
+                f"(valid: {', '.join(sorted(valid_types))})"
+            )
+    if not widget.get("id"):
+        errors.append(f"{where} missing 'id'")
+    width = widget.get("width", "full")
+    if width not in VALID_WIDTHS:
+        errors.append(f"{where}: invalid width '{width}' (valid: {VALID_WIDTHS})")
+
+    if schema < 2:
+        # v1 checks, FROZEN byte-for-byte: the fleet's schema-1 manifests may
+        # carry arbitrary stray keys (source/height/format included) that were
+        # always inert — erroring on them now would block re-saves of
+        # previously-valid manifests.
+        if wtype in _TYPES_REQUIRING_DATA and not widget.get("rpc_method"):
+            errors.append(f"{where}: '{wtype}' requires 'rpc_method'")
+        if wtype == "table" and not widget.get("columns"):
+            errors.append(f"{where}: 'table' requires 'columns'")
+        return
+
+    # ── v2 widget checks ────────────────────────────────────────────────────
+    source = widget.get("source")
+    if source is not None:
+        if not isinstance(source, str) or source not in source_ids:
+            errors.append(f"{where}: 'source' must name a data_source id declared on this page")
+    if wtype in _TYPES_REQUIRING_DATA and not widget.get("rpc_method") and not source:
+        errors.append(f"{where}: '{wtype}' requires 'rpc_method' or a 'source' binding")
+    if wtype == "table":
+        if not widget.get("columns"):
+            errors.append(f"{where}: 'table' requires 'columns'")
+        else:
+            _validate_columns_v2(widget, where, errors)
+    height = widget.get("height")
+    if height is not None and height not in V2_CHART_HEIGHTS:
+        errors.append(f"{where}: 'height' must be one of {sorted(V2_CHART_HEIGHTS)}")
+    if wtype == "image" and not _is_safe_asset_path(widget.get("src")):
+        errors.append(f"{where}: 'image' requires 'src' — a zip-relative path under "
+                      "dashboard/ (no traversal)")
+    if wtype == "heading":
+        text = widget.get("text")
+        if not isinstance(text, str) or not text or len(text) > 200:
+            errors.append(f"{where}: 'heading' requires 'text' (string, max 200 chars)")
+        level = widget.get("level")
+        if level is not None and level not in (1, 2, 3):
+            errors.append(f"{where}: 'heading' level must be 1, 2 or 3")
+    if wtype == "action_button":
+        # Deliberately a DIFFERENT field than rpc_method: the widget-data
+        # route serves widget.rpc_method to VIEWERS from cache, and an action
+        # is a write — action_rpc_method is only reachable through the
+        # manager-gated, never-cached direct RPC route.
+        action = widget.get("action_rpc_method")
+        if not isinstance(action, str) or not _RPC_NAME_RE.match(action or ""):
+            errors.append(f"{where}: 'action_button' requires 'action_rpc_method' "
+                          "(letters, digits, _ or -, max 64)")
+        if widget.get("rpc_method"):
+            errors.append(f"{where}: 'action_button' must use 'action_rpc_method', "
+                          "not 'rpc_method' (actions are writes — never viewer-fetchable)")
+        label = widget.get("label")
+        if not isinstance(label, str) or not label or len(label) > 80:
+            errors.append(f"{where}: 'action_button' requires 'label' (string, max 80 chars)")
+        style = widget.get("style")
+        if style is not None and style not in V2_ACTION_STYLES:
+            errors.append(f"{where}: 'action_button' style must be one of {sorted(V2_ACTION_STYLES)}")
+        for _k, _cap in (("confirm", 300), ("success_message", 200)):
+            _v = widget.get(_k)
+            if _v is not None and (not isinstance(_v, str) or len(_v) > _cap):
+                errors.append(f"{where}: 'action_button' {_k} must be a string of at most {_cap} chars")
+    vw = widget.get("visible_when")
+    if vw is not None:
+        # Cosmetic display toggle driven by a page data source. NOT access
+        # control — the widget still renders in the DOM and its data is still
+        # fetchable; use 'permission' to actually restrict who sees data.
+        if not isinstance(vw, dict):
+            errors.append(f"{where}: 'visible_when' must be an object "
+                          "{{source, path, equals?}}")
+        else:
+            vw_src = vw.get("source")
+            if not isinstance(vw_src, str) or vw_src not in source_ids:
+                errors.append(f"{where}: 'visible_when.source' must name a data_source "
+                              "id declared on this page")
+            vw_path = vw.get("path")
+            if not isinstance(vw_path, str) or not vw_path or len(vw_path) > 200:
+                errors.append(f"{where}: 'visible_when.path' is required (dot path into "
+                              "the source response)")
+            if not isinstance(vw.get("equals", None),
+                              (str, int, float, bool, type(None))):
+                errors.append(f"{where}: 'visible_when.equals' must be a scalar")
+    _validate_refresh(widget.get("refresh_seconds"), where, errors)
+    _validate_permission(widget, where, errors)
+
+
+def _validate_container(entry: dict, where: str, source_ids: set, errors: list) -> None:
+    ctype = entry.get("type")
+    if not entry.get("id"):
+        errors.append(f"{where} missing 'id'")
+    if ctype == "section":
+        heading = entry.get("heading")
+        if heading is not None and (not isinstance(heading, str) or len(heading) > 120):
+            errors.append(f"{where}: section 'heading' must be a string of at most 120 chars")
+        desc = entry.get("description")
+        if desc is not None and (not isinstance(desc, str) or len(desc) > 500):
+            errors.append(f"{where}: section 'description' must be a string of at most 500 chars")
+        if entry.get("collapsible") is not None and not isinstance(entry.get("collapsible"), bool):
+            errors.append(f"{where}: section 'collapsible' must be true or false")
+        children = entry.get("widgets")
+        if not isinstance(children, list) or not children:
+            errors.append(f"{where}: section requires a non-empty 'widgets' list")
+            children = []
+        for j, child in enumerate(children):
+            cw = f"{where} widget {j}"
+            if not isinstance(child, dict):
+                errors.append(f"{cw} must be an object")
+            elif child.get("type") in V2_CONTAINER_TYPES:
+                errors.append(f"{cw}: containers cannot nest (one level only)")
+            else:
+                _validate_plain_widget(child, cw, 2, source_ids, errors)
+        _validate_permission(entry, where, errors)
+    elif ctype == "tabs":
+        tabs = entry.get("tabs")
+        if not isinstance(tabs, list) or not tabs:
+            errors.append(f"{where}: tabs requires a non-empty 'tabs' list")
+            tabs = []
+        seen: set = set()
+        for t, tab in enumerate(tabs):
+            tw = f"{where} tab {t}"
+            if not isinstance(tab, dict):
+                errors.append(f"{tw} must be an object")
+                continue
+            tid = tab.get("id")
+            if not isinstance(tid, str) or not _ID_RE.match(tid):
+                errors.append(f"{tw}: 'id' is required (letters, digits, _ or -, max 64)")
+            elif tid in seen:
+                errors.append(f"{tw}: duplicate tab id '{tid}'")
+            else:
+                seen.add(tid)
+            if not tab.get("title"):
+                errors.append(f"{tw} missing 'title'")
+            for j, child in enumerate(tab.get("widgets") or []):
+                cw = f"{tw} widget {j}"
+                if not isinstance(child, dict):
+                    errors.append(f"{cw} must be an object")
+                elif child.get("type") in V2_CONTAINER_TYPES:
+                    errors.append(f"{cw}: containers cannot nest (one level only)")
+                else:
+                    _validate_plain_widget(child, cw, 2, source_ids, errors)
+        _validate_permission(entry, where, errors)
+
+
+def validate_dashboard_manifest(manifest: dict) -> list:
+    """Validate a dashboard manifest. Returns a list of error strings (empty = valid)."""
+    errors: list = []
+    if not isinstance(manifest, dict):
+        return ["Manifest must be a JSON object"]
+
+    schema = manifest.get("schema", 1)
+    if schema not in (1, 2):
+        errors.append("'schema' must be 1 or 2")
+        return errors
+
+    mode = manifest.get("mode", "manifest")
+    if mode not in ("manifest", "iframe"):
+        errors.append("'mode' must be 'manifest' or 'iframe'")
+        return errors
+
+    pages = manifest.get("pages")
+    if pages is not None and not isinstance(pages, list):
+        errors.append("'pages' must be a list")
+        return errors
+
+    _validate_rpc_block(manifest, errors)
+
+    # theme is validated (and rendered) only under schema 2; in a v1 manifest a
+    # stray "theme" key stays inert like every other unknown key (v1 freeze).
+    if schema >= 2 and manifest.get("theme") is not None:
+        _validate_theme(manifest.get("theme"), errors)
+
+    if mode == "iframe":
+        # Iframe mode: pages need 'src' pointing to HTML files, no widgets
+        for i, page in enumerate(pages or []):
+            if not isinstance(page, dict):
+                errors.append(f"Page {i} must be an object")
+                continue
+            if not page.get("id"):
+                errors.append(f"Page {i} missing 'id'")
+            if not page.get("title"):
+                errors.append(f"Page {i} missing 'title'")
+            src = page.get("src", "")
+            if not src:
+                errors.append(f"Page {i}: iframe mode requires 'src' field")
+            elif ".." in src or src.startswith("/") or src.startswith("\\"):
+                errors.append(f"Page {i}: invalid 'src' path (no traversal allowed)")
+        return errors
+
+    # Manifest mode: validate page + widget structure
+    _all_source_ids: set = set()
+    for i, page in enumerate(pages or []):
+        where = f"Page {i}"
+        if not isinstance(page, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        if not page.get("id"):
+            errors.append(f"{where} missing 'id'")
+        if not page.get("title"):
+            errors.append(f"{where} missing 'title'")
+
+        # data_sources are validated (and fetched) only under schema 2; in v1 a
+        # stray key stays inert (v1 freeze).
+        source_ids = _validate_data_sources(page, where, errors, seen_global=_all_source_ids) \
+            if schema >= 2 else set()
+        if schema >= 2:
+            _validate_permission(page, where, errors)
+
+        for j, widget in enumerate(page.get("widgets", [])):
+            wwhere = f"{where} widget {j}"
+            if not isinstance(widget, dict):
+                errors.append(f"{wwhere} must be an object")
+                continue
+            wtype = widget.get("type", "")
+            if wtype in V2_CONTAINER_TYPES:
+                if schema < 2:
+                    errors.append(f"{wwhere}: widget type '{wtype}' requires \"schema\": 2")
+                else:
+                    _validate_container(widget, wwhere, source_ids, errors)
+                continue
+            _validate_plain_widget(widget, wwhere, schema, source_ids, errors)
+
+    # Schema 2 only (v1 freeze): widget ids must be unique across the WHOLE
+    # manifest — mock maps, the widget-data route and the copilot's diff keys
+    # all resolve by id, and a duplicate silently resolves to whichever page
+    # declared it first (or last, for mocks).
+    if schema >= 2:
+        _seen_widget_ids: set = set()
+        _action_names: set = set()
+        _readable_names: set = set()
+        for page in pages or []:
+            if not isinstance(page, dict):
+                continue
+            for src in page.get("data_sources") or []:
+                if isinstance(src, dict) and isinstance(src.get("rpc_method"), str):
+                    _readable_names.add(src["rpc_method"])
+            for w in iter_manifest_widgets(page):
+                wid = w.get("id")
+                if wid:
+                    if wid in _seen_widget_ids:
+                        errors.append(f"duplicate widget id '{wid}' "
+                                      "(ids must be unique across the whole manifest)")
+                    else:
+                        _seen_widget_ids.add(wid)
+                if w.get("type") == "action_button" and isinstance(w.get("action_rpc_method"), str):
+                    _action_names.add(w["action_rpc_method"])
+                elif isinstance(w.get("rpc_method"), str):
+                    _readable_names.add(w["rpc_method"])
+        # An action's method must never ALSO be bound as a readable
+        # rpc_method / data source — that alias would make the write
+        # viewer-fetchable (and 5s-cached) through the widget-data and source
+        # endpoints, defeating the whole point of the separate field.
+        for name in sorted(_action_names & _readable_names):
+            errors.append(
+                f"action_rpc_method '{name}' is also bound as a readable "
+                "rpc_method/data source — actions are writes and need a "
+                "dedicated handler name")
+
+    return errors
+
+
+def iter_manifest_widgets(page: dict):
+    """Yield every PLAIN widget on a manifest-mode page, recursing one level
+    into v2 containers (section/tabs)."""
+    if not isinstance(page, dict):
+        return
+    for entry in page.get("widgets") or []:
+        if not isinstance(entry, dict):
+            continue
+        etype = entry.get("type")
+        if etype == "section":
+            for child in entry.get("widgets") or []:
+                if isinstance(child, dict):
+                    yield child
+        elif etype == "tabs":
+            for tab in entry.get("tabs") or []:
+                if isinstance(tab, dict):
+                    for child in tab.get("widgets") or []:
+                        if isinstance(child, dict):
+                            yield child
+        else:
+            yield entry
+
+
+def manifest_widget_rpc_names(manifest: dict) -> set:
+    """RPC methods that manifest-mode widgets INVOKE on page load — widget
+    ``rpc_method`` / ``save_rpc_method`` fields (recursing containers) plus v2
+    page-level ``data_sources``. Each must have a matching
+    ``@plugin.on_dashboard("<name>")`` handler or the widget renders an error
+    box for every customer."""
+    names: set = set()
+    if not isinstance(manifest, dict):
+        return names
+    for page in manifest.get("pages") or []:
+        if not isinstance(page, dict):
+            continue
+        for src in page.get("data_sources") or []:
+            if isinstance(src, dict):
+                m = src.get("rpc_method")
+                if isinstance(m, str) and m:
+                    names.add(m)
+        for widget in iter_manifest_widgets(page):
+            # action_rpc_method only counts on REAL actions (schema-2
+            # action_button widgets) — v1 fleet manifests may carry stray
+            # inert keys of that name.
+            _schema2 = manifest.get("schema", 1) == 2
+            _is_action = _schema2 and widget.get("type") == "action_button"
+            for field_name in (("rpc_method", "save_rpc_method", "action_rpc_method")
+                               if _is_action else ("rpc_method", "save_rpc_method")):
+                m = widget.get(field_name)
+                if isinstance(m, str) and m:
+                    names.add(m)
+    return names
+
+
+def manifest_declared_rpc_names(manifest: dict) -> set:
+    """Keys of the ``rpc`` declaration block. A declaration is an ALLOWLIST
+    grant, not a promise of implementation, so a declared-but-unimplemented
+    name is a WARNING in the artifact validator, never an error."""
+    names: set = set()
+    if not isinstance(manifest, dict):
+        return names
+    rpc = manifest.get("rpc")
+    if isinstance(rpc, dict):
+        names.update(n for n in rpc.keys() if isinstance(n, str))
+    return names
+
+
+# ── Sandbox SQL validator (vendored from core/api_sandbox.py) ───────────────
+#
+# The platform's SQL dry-check imports ``_validate_plugin_sql`` from
+# api_sandbox. That module is platform-only, so the function and its helpers
+# are inlined here. Error strings are surfaced verbatim inside the
+# ``plugin_sql_rejected`` message and must stay byte-identical.
+
+_SQL_ALLOWED_STATEMENTS = {"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE TABLE", "ALTER TABLE", "DROP TABLE", "CREATE INDEX", "DROP INDEX"}
+_SQL_BLOCKED_PATTERNS = [
+    "CREATE FUNCTION", "CREATE TRIGGER", "CREATE EXTENSION", "CREATE ROLE", "CREATE USER",
+    "COPY ", "pg_dump", "pg_restore", "GRANT ", "REVOKE ", "ALTER ROLE", "ALTER SYSTEM",
+    "SET ROLE", "SET SESSION", "RESET ROLE", "LISTEN ", "NOTIFY ", "PREPARE ",
+    "DO $$", "DO $", "LOAD ", "lo_import", "lo_export",
+    "pg_catalog", "pg_stat", "information_schema",
+    # Function-based role/privilege manipulation and file/network access that
+    # can ride *inside* an otherwise-allowlisted SELECT.
+    "set_config", "current_setting", "pg_read_file", "pg_read_binary_file",
+    "pg_ls_dir", "pg_logdir_ls", "pg_stat_file", "dblink",
+    "lo_get", "lo_put", "lo_from_bytea", "DROP SCHEMA", "TRUNCATE",
+    "SECURITY DEFINER",
+]
+
+_DOLLAR_TAG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Schema-qualified reference to a plugin sandbox schema:
+#   plugin_<safe_pid>_<srv>.<identifier>
+_RE_PLUGIN_SCHEMA_QUALIFIED = re.compile(
+    r'(?<![A-Za-z0-9_."])"?(plugin_[a-z0-9_]+)"?\s*\.',
+    re.IGNORECASE,
+)
+
+
+def _assert_single_statement(sql: str) -> None:
+    """Reject SQL containing more than one top-level statement.
+
+    psycopg uses the simple query protocol for parameter-less queries, which
+    executes *every* semicolon-separated statement in one round-trip, so the
+    sandbox enforces exactly one statement per call.
+
+    The scan is string-, identifier- and dollar-quote-aware so that semicolons
+    inside literals are not treated as separators. Expects comment-stripped
+    input (caller strips ``--`` and ``/* */`` first).
+    """
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "$":
+            # Possible dollar-quoted string: $tag$ ... $tag$ (tag may be empty).
+            close_tag = sql.find("$", i + 1)
+            if close_tag != -1:
+                inner = sql[i + 1:close_tag]
+                if inner == "" or _DOLLAR_TAG_RE.match(inner):
+                    tag = sql[i:close_tag + 1]
+                    end = sql.find(tag, close_tag + 1)
+                    if end == -1:
+                        return  # unterminated dollar-quote -> invalid SQL anyway
+                    i = end + len(tag)
+                    continue
+            i += 1
+            continue
+        if c == "'":
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2  # '' escaped quote, stay in string
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n:
+                if sql[i] == '"':
+                    if i + 1 < n and sql[i + 1] == '"':
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == ";":
+            # Trailing semicolons / whitespace are fine; real content after a
+            # top-level ';' means a second statement.
+            if sql[i + 1:].strip(" \t\r\n;"):
+                raise ValueError(
+                    "Only one SQL statement is allowed per call; "
+                    "remove the ';'-separated statement(s)"
+                )
+            return
+        i += 1
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove SQL comments (``--`` line and ``/* */`` block) that Postgres
+    would treat as comments, leaving comment markers that live INSIDE a string
+    literal / quoted identifier / dollar-quoted body untouched.
+
+    Uses the SAME quote/dollar-quote state machine as
+    ``_assert_single_statement`` so the validator's notion of "inside a string"
+    matches Postgres's real lexer. Removed comment spans are replaced with a
+    single space so adjacent tokens never fuse.
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "$":
+            # Possible dollar-quoted string: $tag$ ... $tag$ (tag may be empty).
+            close_tag = sql.find("$", i + 1)
+            if close_tag != -1:
+                inner = sql[i + 1:close_tag]
+                if inner == "" or _DOLLAR_TAG_RE.match(inner):
+                    tag = sql[i:close_tag + 1]
+                    end = sql.find(tag, close_tag + 1)
+                    if end == -1:
+                        # Unterminated dollar-quote -> rest is "inside" the
+                        # string; copy verbatim (invalid SQL anyway).
+                        out.append(sql[i:])
+                        return "".join(out)
+                    out.append(sql[i:end + len(tag)])
+                    i = end + len(tag)
+                    continue
+            out.append(c)
+            i += 1
+            continue
+        if c == "'":
+            out.append(c)
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        out.append(sql[i:i + 2])  # '' escaped quote, stay in string
+                        i += 2
+                        continue
+                    out.append(sql[i])
+                    i += 1
+                    break
+                out.append(sql[i])
+                i += 1
+            continue
+        if c == '"':
+            out.append(c)
+            i += 1
+            while i < n:
+                if sql[i] == '"':
+                    if i + 1 < n and sql[i + 1] == '"':
+                        out.append(sql[i:i + 2])
+                        i += 2
+                        continue
+                    out.append(sql[i])
+                    i += 1
+                    break
+                out.append(sql[i])
+                i += 1
+            continue
+        # Outside any quoted region: real comments start here.
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":
+            # -- line comment: drop through end of line (the newline is kept).
+            nl = sql.find("\n", i + 2)
+            if nl == -1:
+                out.append(" ")
+                return "".join(out)
+            out.append(" ")
+            i = nl
+            continue
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":
+            # /* block comment */: drop through the closing */.
+            end = sql.find("*/", i + 2)
+            if end == -1:
+                # Unterminated block comment -> invalid SQL; drop the rest.
+                out.append(" ")
+                return "".join(out)
+            out.append(" ")
+            i = end + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _mask_sql_string_literals(sql: str) -> str:
+    """Return `sql` with single-quoted string and dollar-quoted bodies replaced
+    by spaces, preserving length-neutral structure for token scans.
+
+    Double-quoted identifiers are copied through verbatim: a quoted identifier
+    such as ``"plugin_x_999"`` IS a real schema reference (case-preserving
+    identifier, not data), so it must stay visible to the check. Expects
+    comment-stripped input.
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "$":
+            close_tag = sql.find("$", i + 1)
+            if close_tag != -1:
+                inner = sql[i + 1:close_tag]
+                if inner == "" or _DOLLAR_TAG_RE.match(inner):
+                    tag = sql[i:close_tag + 1]
+                    end = sql.find(tag, close_tag + 1)
+                    if end == -1:
+                        # Unterminated dollar-quote -> rest is "inside" the
+                        # string; mask it all (invalid SQL anyway).
+                        out.append(" " * (n - i))
+                        return "".join(out)
+                    out.append(" " * (end + len(tag) - i))
+                    i = end + len(tag)
+                    continue
+            out.append(c)
+            i += 1
+            continue
+        if c == "'":
+            # Mask the whole single-quoted string (including the quotes) so its
+            # contents can never be read as identifiers.
+            out.append(" ")
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        out.append("  ")  # '' escaped quote, stay in string
+                        i += 2
+                        continue
+                    out.append(" ")
+                    i += 1
+                    break
+                out.append(" ")
+                i += 1
+            continue
+        if c == '"':
+            # Double-quoted identifier: real identifier, copy through verbatim.
+            out.append(c)
+            i += 1
+            while i < n:
+                if sql[i] == '"':
+                    if i + 1 < n and sql[i + 1] == '"':
+                        out.append(sql[i:i + 2])
+                        i += 2
+                        continue
+                    out.append(sql[i])
+                    i += 1
+                    break
+                out.append(sql[i])
+                i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _validate_plugin_sql(sql: str, active_schema: Optional[str] = None) -> str:
+    """Validate and classify a SQL statement. Returns the statement type or raises ValueError."""
+    # Strip SQL comments to prevent blocklist bypass. String/identifier/
+    # dollar-quote-aware so comment markers INSIDE a literal are preserved
+    # (Postgres executes them as data, not as comments).
+    stripped = _strip_sql_comments(sql)
+    # Strip Unicode zero-width characters
+    stripped = re.sub(r"[​‌‍﻿]", "", stripped)
+
+    # Reject multiple statements BEFORE the blocklist/allowlist, so a
+    # benign-looking allowlisted prefix can't smuggle a second statement past
+    # psycopg's simple (multi-statement) protocol.
+    _assert_single_statement(stripped)
+
+    # Cross-tenant SQL: any reference to a `plugin_`-prefixed schema OTHER than
+    # the active schema is a cross-tenant access attempt. Only checkable when
+    # the caller knows the live schema name — the artifact validator does not,
+    # so it passes active_schema=None and this check stays off there (same as
+    # on the platform).
+    if active_schema is not None:
+        masked = _mask_sql_string_literals(stripped)
+        for m in _RE_PLUGIN_SCHEMA_QUALIFIED.finditer(masked):
+            referenced = m.group(1).lower()
+            if referenced != active_schema.lower():
+                raise ValueError(
+                    "Cross-schema reference not allowed: "
+                    f"{referenced!r}. Plugin SQL must be unqualified (it runs "
+                    "in your server's schema via search_path)."
+                )
+
+    normalized = " ".join(stripped.strip().split()).upper()
+
+    if not normalized:
+        raise ValueError("Empty SQL statement")
+
+    # Check blocklist
+    for pattern in _SQL_BLOCKED_PATTERNS:
+        if pattern.upper() in normalized:
+            raise ValueError(f"Blocked SQL pattern: {pattern}")
+
+    # CREATE UNIQUE INDEX is CREATE INDEX plus a uniqueness constraint — same
+    # security profile, same sandbox schema. Normalize the returned type so the
+    # DDL rate limiter treats it as CREATE INDEX.
+    if normalized.startswith("CREATE UNIQUE INDEX"):
+        return "CREATE INDEX"
+
+    # Check allowlist
+    for allowed in _SQL_ALLOWED_STATEMENTS:
+        if normalized.startswith(allowed):
+            return allowed
+
+    raise ValueError(f"SQL statement type not allowed. Permitted: {', '.join(sorted(_SQL_ALLOWED_STATEMENTS))}")
+
+
 @dataclass
 class Finding:
     """One validation result.
@@ -278,6 +1180,7 @@ def validate_artifact(
     version: str,
     artifact_bytes: bytes,
     effective_manifest: Optional[dict] = None,
+    stored_dashboard_manifest: Optional[dict] = None,
 ) -> ValidationResult:
     """Run all pre-submit checks on a zipped plugin artifact.
 
@@ -287,6 +1190,15 @@ def validate_artifact(
         artifact_bytes: raw .zip content as fetched from artifact storage.
         effective_manifest: optional override for capability checks (when the
             caller has a merged view of declared + auto-detected caps).
+        stored_dashboard_manifest: a dashboard manifest that lives OUTSIDE the
+            zip but is known to survive onto this version — the version row's
+            ``dashboard_manifest`` column (Dev Portal Dashboard Editor), or the
+            carry-forward candidate for a version being ingested. Suppresses the
+            false ``dashboard_handler_without_manifest`` warning for
+            editor-authored dashboards. Only manifest-mode counts (iframe
+            manifests render zip-shipped files, so a zip without ``dashboard/``
+            genuinely has no iframe dashboard). The `yourbot validate` CLI has
+            no access to platform state and leaves this None.
 
     Returns a :class:`ValidationResult`. ``result.has_errors`` is the gate
     for blocking submission; ``result.warnings`` are surfaced to the dev as
@@ -429,15 +1341,16 @@ def validate_artifact(
                     )
 
     # 5. Capability-declared-vs-used cross check
+    # Pull all .py sources from the artifact
     py_paths = [n for n in namelist
                 if n.endswith(".py") and not _is_excluded_path(n)]
+    py_sources: list[bytes] = []
+    for p in py_paths:
+        try:
+            py_sources.append(zf.read(p))
+        except Exception:
+            continue
     if py_paths:
-        py_sources: list[bytes] = []
-        for p in py_paths:
-            try:
-                py_sources.append(zf.read(p))
-            except Exception:
-                continue
         try:
             detected = set(_detect_capabilities(py_sources))
         except Exception:
@@ -467,6 +1380,186 @@ def validate_artifact(
                     hint="Remove unused capabilities — customers are more "
                          "likely to install plugins that ask for fewer permissions.",
                 )
+
+    # 5b. Bundled-import + dashboard-wiring sanity. Catches two common (esp.
+    # AI-generated) mistakes that pass every other check but break silently at
+    # runtime: importing a module that was never shipped/declared, and writing an
+    # @on_dashboard handler without the manifest section that renders it.
+    if py_paths:
+        import ast as _ast
+        import re as _re
+        import sys as _sys
+
+        # Imports must come from real ast.Import / ast.ImportFrom nodes —
+        # a raw-text scan also matches prose inside docstrings and strings
+        # (customer-reported: a docstring line "from _begin until every
+        # statement has landed." flagged a phantom "_begin" dependency).
+        # Relative imports (level > 0) are bundled by definition and skipped.
+        import_roots: set[str] = set()
+        for _src in py_sources:
+            _txt = _src.decode("utf-8", "replace")
+            try:
+                _tree = _ast.parse(_txt)
+            except (SyntaxError, ValueError):
+                # Unparseable source can't be AST-scanned; keep the line-based
+                # scan for that file so broken code doesn't lose coverage.
+                for _m in _re.finditer(r"(?m)^[ \t]*(?:import|from)[ \t]+([A-Za-z_]\w*)", _txt):
+                    import_roots.add(_m.group(1))
+                continue
+            for _node in _ast.walk(_tree):
+                if isinstance(_node, _ast.Import):
+                    for _imp_alias in _node.names:
+                        import_roots.add(_imp_alias.name.split(".")[0])
+                elif isinstance(_node, _ast.ImportFrom) and not _node.level and _node.module:
+                    import_roots.add(_node.module.split(".")[0])
+
+        _stdlib = set(getattr(_sys, "stdlib_module_names", set()))
+        _bundled = {n[:-3] for n in namelist if n.endswith(".py") and "/" not in n}
+        _bundled |= {n.split("/")[0] for n in namelist if n.endswith("/__init__.py")}
+        _always_ok = {"yourbot_sdk", "mmo_maid_sdk", "__future__", "__main__"}
+        # import root -> PyPI distribution name for the common mismatches
+        _alias = {"google": "protobuf", "yaml": "pyyaml", "PIL": "pillow",
+                  "cv2": "opencv-python", "bs4": "beautifulsoup4",
+                  "dateutil": "python-dateutil", "dotenv": "python-dotenv"}
+        _req_roots: set[str] = set()
+        if "requirements.txt" in namelist:
+            try:
+                for _line in zf.read("requirements.txt").decode("utf-8", "replace").splitlines():
+                    _line = _line.strip()
+                    if not _line or _line.startswith("#"):
+                        continue
+                    _name = _re.split(r"[=<>!~;\[ ]", _line, maxsplit=1)[0].strip().lower().replace("_", "-")
+                    if _name:
+                        _req_roots.add(_name)
+            except Exception:
+                pass
+        for _root in sorted(import_roots):
+            if _root in _stdlib or _root in _bundled or _root in _always_ok:
+                continue
+            _dist = _alias.get(_root, _root).lower().replace("_", "-")
+            if _dist in _req_roots or _root.lower().replace("_", "-") in _req_roots:
+                continue
+            result.add(
+                "warning", "import_not_bundled_or_declared",
+                f"Your code imports \"{_root}\", but it is neither bundled in the zip "
+                f"nor listed in requirements.txt. The sandbox has no network and a "
+                f"read-only filesystem, so this import will fail at runtime (and if it "
+                f"is wrapped in try/except, the feature silently does nothing).",
+                hint=f"Ship {_root}.py inside the plugin zip, or add its package to "
+                     "requirements.txt (e.g. a *_pb2 module needs \"protobuf\").",
+            )
+
+        _has_dash_handler = any(b".on_dashboard(" in s for s in py_sources)
+        # The dashboard is surfaced by a dashboard_manifest.json file at the zip root,
+        # a dashboard/ directory (iframe mode), a manifest-embedded key, OR by the
+        # Dev Portal Dashboard Editor (stored on the version row, not in the zip) —
+        # callers pass that last one via stored_dashboard_manifest.
+        _has_dash_manifest = (
+            any(n == "dashboard_manifest.json" or n.endswith("/dashboard_manifest.json") for n in namelist)
+            or any("/dashboard/" in n or n.startswith("dashboard/") for n in namelist)
+            or bool(isinstance(manifest_dict, dict) and manifest_dict.get("dashboard_manifest"))
+            or bool(
+                isinstance(stored_dashboard_manifest, dict)
+                and stored_dashboard_manifest
+                and str(stored_dashboard_manifest.get("mode", "manifest")) == "manifest"
+            )
+        )
+        if _has_dash_handler and not _has_dash_manifest:
+            result.add(
+                "warning", "dashboard_handler_without_manifest",
+                "Your code has an @plugin.on_dashboard handler, but nothing surfaces it: "
+                "there is no dashboard_manifest.json in the zip and no dashboard/ directory. "
+                "Without one, the platform renders no dashboard and the handler is never called.",
+                hint="Ship a dashboard_manifest.json at the zip root (with pages/widgets whose "
+                     "rpc_method names match your handlers), or configure it in the Dev Portal "
+                     "Dashboard Editor. See reference/dashboards.md.",
+            )
+
+        # 5b-2. Dashboard manifest schema + handler wiring — ERROR level, so a
+        # broken dashboard blocks submit-for-review instead of shipping widgets
+        # that render a 10s-timeout error box for every customer. The schema is
+        # vendored above from core/dashboard_manifest.py (single source for
+        # every ingestion path).
+        _dash_zip_name = next(
+            (n for n in namelist
+             if n == "dashboard_manifest.json" or n.endswith("/dashboard_manifest.json")),
+            None,
+        )
+        if _dash_zip_name is not None:
+            _vdm = validate_dashboard_manifest
+            _dash_widget_rpc_names = manifest_widget_rpc_names
+            _dash_declared_rpc_names = manifest_declared_rpc_names
+            _dash_obj = None
+            try:
+                _dash_obj = json.loads(zf.read(_dash_zip_name))
+            except Exception:
+                result.add(
+                    "error", "dashboard_manifest_unparseable",
+                    f"{_dash_zip_name} is not valid JSON — the platform cannot render "
+                    "a dashboard from it, so it would be dropped for every customer.",
+                    hint="Fix the JSON (a trailing comma is the usual culprit) and re-upload.",
+                )
+            if _dash_obj is not None:
+                if not isinstance(_dash_obj, dict):
+                    _dash_errors = ["dashboard_manifest.json must be a JSON object"]
+                else:
+                    _dash_errors = _vdm(_dash_obj)
+                for _msg in _dash_errors[:10]:
+                    result.add(
+                        "error", "dashboard_manifest_invalid",
+                        f"dashboard_manifest.json: {_msg}",
+                        hint="See reference/dashboards.md for the manifest schema.",
+                    )
+                if not _dash_errors and isinstance(_dash_obj, dict):
+                    # Handler cross-check. Matches both decorator and
+                    # direct-call registration styles.
+                    _handler_re = re.compile(
+                        rb"\.on_dashboard\(\s*[\"']([A-Za-z0-9_\-]{1,64})[\"']")
+                    _handler_names = set()
+                    _literal_calls = 0
+                    for _src in py_sources:
+                        for _hm in _handler_re.finditer(_src):
+                            _literal_calls += 1
+                            _handler_names.add(_hm.group(1).decode("ascii", "replace"))
+                    # The regex only sees literal-string registration. Code that
+                    # registers dynamically (plugin.on_dashboard(name)(fn) in a
+                    # loop) has more .on_dashboard( call sites than literal
+                    # matches — in that case a "missing" handler may exist at
+                    # runtime, so downgrade to warning instead of blocking.
+                    _total_calls = sum(_src.count(b".on_dashboard(") for _src in py_sources)
+                    _dynamic_reg = _total_calls > _literal_calls
+                    # Widget-invoked methods fire on page load — a missing
+                    # handler errors for every customer, so it blocks submit
+                    # (unless registration is dynamic and unprovable here).
+                    for _wanted in sorted(_dash_widget_rpc_names(_dash_obj)):
+                        if _wanted not in _handler_names:
+                            result.add(
+                                "warning" if _dynamic_reg else "error",
+                                "dashboard_rpc_method_missing_handler",
+                                f'dashboard_manifest.json widget references RPC method '
+                                f'"{_wanted}", but no @plugin.on_dashboard("{_wanted}") '
+                                "handler exists in the code — that widget errors for "
+                                "every customer on page load."
+                                + (" (Registration looks dynamic, so this may resolve "
+                                   "at runtime — verify on a test server.)" if _dynamic_reg else ""),
+                                hint=f'Add @plugin.on_dashboard("{_wanted}") in __main__.py, '
+                                     "or remove the widget's reference to it.",
+                            )
+                    # Declared-but-unimplemented rpc-block names are only a
+                    # warning: the declaration is an allowlist grant, and the
+                    # canned iframe dashboard probes optional methods
+                    # (get_settings) then degrades gracefully.
+                    for _wanted in sorted(_dash_declared_rpc_names(_dash_obj)
+                                          - _handler_names
+                                          - _dash_widget_rpc_names(_dash_obj)):
+                        result.add(
+                            "warning", "dashboard_declared_rpc_no_handler",
+                            f'dashboard_manifest.json declares RPC method "{_wanted}" in its '
+                            f'"rpc" block, but no @plugin.on_dashboard("{_wanted}") handler '
+                            "exists — calls to it will fail at runtime.",
+                            hint="Implement the handler, or drop the declaration if the "
+                                 "dashboard treats it as optional.",
+                        )
 
     # 5c. Slash-command consistency — the checks that keep "what the dev
     # reviewed" equal to "what Discord runs". Discord registration is driven
@@ -501,6 +1594,12 @@ def validate_artifact(
         except Exception:
             continue
         for finding in _scan_forbidden_patterns(path, data):
+            result.findings.append(finding)
+        # 6b. Contract checks that look INSIDE the call — the classes that
+        # actually kill plugins in production and that nothing else here sees.
+        for finding in _scan_ctx_call_signatures(path, data):
+            result.findings.append(finding)
+        for finding in _scan_plugin_sql(path, data):
             result.findings.append(finding)
 
     # 7. Junk files that shouldn't be in a published plugin
@@ -991,6 +2090,333 @@ _FORBIDDEN_IMPORTS = {
     "multiprocessing": ("forbidden_import_multiprocessing",
                         "multiprocessing is unavailable in the sandbox."),
 }
+
+
+# ── ctx call-signature lint ────────────────────────────────────────────────
+#
+# Every other check in this module is about wiring — zip layout, manifest
+# fields, declared-vs-used capabilities. None of them look INSIDE a ctx call, so
+# the most common way a plugin dies in production was invisible here: the whole
+# ctx surface is keyword-only, and a positional call raises TypeError on the
+# first event. The SDK swallows handler exceptions, so the plugin looks
+# installed while every event silently no-ops until the circuit breaker trips.
+#
+# The signature table is introspected from THIS SDK's own ``_context`` module
+# rather than hard-coded, so it cannot drift the way a copied table would. (The
+# platform introspects the installed ``yourbot_sdk`` for the same reason — same
+# module, same table.)
+
+_CTX_CLASS_TO_ATTR = {
+    "_SecretsApi": "secrets",
+    "_KvApi": "kv",
+    "_DiscordApi": "discord",
+    "_HttpApi": "http",
+    "_WsApi": "ws",
+    "_InteractionApi": "interaction",
+    "_MetricsApi": "metrics",
+    "_SqlApi": "sql",
+    "_EphemeralApi": "ephemeral",
+}
+# Names a handler's Context argument realistically goes by. Anything else (a
+# local alias, an attribute on a helper object) is skipped rather than guessed
+# at — a false ERROR here blocks a legitimate submission.
+_CTX_BASE_NAMES = {"ctx", "context"}
+_SQL_EXEC_METHODS = {"execute", "query", "query_one", "scalar"}
+
+_ctx_signature_cache: Optional[dict] = None
+
+
+def _ctx_signatures() -> dict:
+    """Map ``(api_attr, method) -> signature spec`` from this SDK's _context.
+
+    Returns an empty dict if the module is not importable, which disables the
+    lint rather than failing a submission over an environment problem.
+    """
+    global _ctx_signature_cache
+    if _ctx_signature_cache is not None:
+        return _ctx_signature_cache
+
+    table: dict = {}
+    try:
+        import inspect
+        from . import _context as _ctx_mod
+
+        for cls_name, api_attr in _CTX_CLASS_TO_ATTR.items():
+            cls = getattr(_ctx_mod, cls_name, None)
+            if cls is None:
+                continue
+            for meth_name, meth in vars(cls).items():
+                if meth_name.startswith("_") or not callable(meth):
+                    continue
+                try:
+                    sig = inspect.signature(meth)
+                except (TypeError, ValueError):
+                    continue
+                params = list(sig.parameters.values())[1:]  # drop self
+                positional = [
+                    p.name for p in params
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                ]
+                keyword_only = [p.name for p in params if p.kind == p.KEYWORD_ONLY]
+                required_kw = [
+                    p.name for p in params
+                    if p.kind == p.KEYWORD_ONLY and p.default is p.empty
+                ]
+                table[(api_attr, meth_name)] = {
+                    "positional": positional,
+                    "keyword_only": keyword_only,
+                    "required_kw": required_kw,
+                    "accepts_var_kw": any(p.kind == p.VAR_KEYWORD for p in params),
+                    "accepts_var_pos": any(p.kind == p.VAR_POSITIONAL for p in params),
+                }
+    except Exception:  # pragma: no cover - environment-dependent
+        _log.debug("ctx signature lint disabled: _context not importable", exc_info=True)
+        table = {}
+
+    _ctx_signature_cache = table
+    return table
+
+
+def _attr_chain(node) -> Optional[list[str]]:
+    """Flatten ``a.b.c`` into ``["a", "b", "c"]``; None for anything else."""
+    import ast
+
+    parts: list[str] = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return None
+    parts.append(cur.id)
+    parts.reverse()
+    return parts
+
+
+def _resolve_ctx_call(chain: list[str]) -> Optional[tuple[str, str]]:
+    """``["ctx","discord","send_message"] -> ("discord", "send_message")``.
+
+    Also accepts ``self.ctx.<api>.<method>``, the other common shape.
+    """
+    if len(chain) == 3 and chain[0] in _CTX_BASE_NAMES:
+        return chain[1], chain[2]
+    if len(chain) == 4 and chain[0] == "self" and chain[1] in _CTX_BASE_NAMES:
+        return chain[2], chain[3]
+    return None
+
+
+def _typeerror_guarded(tree) -> set:
+    """ids of nodes lexically inside a ``try:`` that catches TypeError.
+
+    A plugin that probes for an SDK method shape it is not sure exists writes
+    ``try: ctx.x.y(new_kwarg=...) except TypeError: <fallback>``. The TypeError
+    is the point of the code, not a defect, so those calls must not be reported.
+
+    Deliberately narrow: only a handler naming TypeError counts. A bare
+    ``except:`` or ``except Exception`` is ordinary defensive error handling, not
+    a signature probe — nearly every handler that touches the Discord API is
+    wrapped in one, so treating those as intent would silence real bugs.
+    """
+    import ast
+
+    guarded: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        catches = False
+        for handler in node.handlers:
+            if handler.type is None:  # bare except — too broad to imply intent
+                continue
+            exc = handler.type
+            names: list[str] = []
+            if isinstance(exc, ast.Name):
+                names = [exc.id]
+            elif isinstance(exc, ast.Attribute):
+                names = [exc.attr]
+            elif isinstance(exc, ast.Tuple):
+                for elt in exc.elts:
+                    if isinstance(elt, ast.Name):
+                        names.append(elt.id)
+                    elif isinstance(elt, ast.Attribute):
+                        names.append(elt.attr)
+            if "TypeError" in names:
+                catches = True
+                break
+        if catches:
+            for stmt in node.body:
+                for child in ast.walk(stmt):
+                    guarded.add(id(child))
+    return guarded
+
+
+def _scan_ctx_call_signatures(path: str, data: bytes) -> list[Finding]:
+    """Bind every literal ``ctx.<api>.<method>(...)`` call against the real SDK
+    signature. Only flags calls that are certain to raise at runtime."""
+    import ast
+
+    table = _ctx_signatures()
+    if not table:
+        return []
+    try:
+        tree = ast.parse(data, filename=path)
+    except SyntaxError:
+        return []  # reported separately by _scan_forbidden_patterns
+
+    guarded = _typeerror_guarded(tree)
+    findings: list[Finding] = []
+    for node in ast.walk(tree):
+        if id(node) in guarded:
+            continue
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        chain = _attr_chain(node.func)
+        if not chain:
+            continue
+        resolved = _resolve_ctx_call(chain)
+        if resolved is None or resolved not in table:
+            continue
+        api, meth = resolved
+        spec = table[resolved]
+        call = f"ctx.{api}.{meth}()"
+
+        # A *args splat makes the positional count unknowable — skip.
+        if any(isinstance(a, ast.Starred) for a in node.args):
+            continue
+        n_pos = len(node.args)
+        if n_pos > len(spec["positional"]) and not spec["accepts_var_pos"]:
+            allowed = ", ".join(spec["positional"]) or "none"
+            findings.append(Finding(
+                severity="error", code="ctx_call_positional_kwonly",
+                message=(
+                    f"{call} was called with {n_pos} positional argument(s) but "
+                    f"accepts at most {len(spec['positional'])}."
+                ),
+                path=path, line=getattr(node, "lineno", None),
+                hint=(
+                    f"Arguments to {call} are keyword-only. Positional: {allowed}. "
+                    f"Keyword-only: {', '.join(spec['keyword_only']) or 'none'}. "
+                    "Pass them by name, e.g. ctx.discord.get_channel(channel_id=cid). "
+                    "This raises TypeError on the first call at runtime."
+                ),
+            ))
+            continue  # the kwarg checks below are meaningless once binding fails
+
+        # A **kwargs splat makes the keyword set unknowable — skip those checks.
+        if any(k.arg is None for k in node.keywords):
+            continue
+        supplied = {k.arg for k in node.keywords if k.arg}
+        if not spec["accepts_var_kw"]:
+            known = set(spec["positional"]) | set(spec["keyword_only"])
+            unknown = sorted(supplied - known)
+            if unknown:
+                # WARNING, not error. An unknown kwarg is the one shape here that
+                # is sometimes deliberate: the ctx surface gains arguments over
+                # time, so a plugin that must run against several SDK versions
+                # probes for the new one and falls back. _typeerror_guarded()
+                # already drops the in-line `try:` form of that, but the probe is
+                # just as often a list of lambdas called inside a try elsewhere,
+                # which no lexical rule can see. Blocking those would reject a
+                # correct plugin, so surface it and let the dev judge. It still
+                # reaches the AI builder's repair loop, which consumes warnings
+                # as well as errors.
+                findings.append(Finding(
+                    severity="warning", code="ctx_call_unknown_kwarg",
+                    message=f"{call} does not accept {', '.join(unknown)}.",
+                    path=path, line=getattr(node, "lineno", None),
+                    hint=(
+                        f"Valid arguments: {', '.join(sorted(known)) or 'none'}. "
+                        "This raises TypeError at runtime unless you are probing "
+                        "for it inside a try/except TypeError."
+                    ),
+                ))
+        bound_positionally = set(spec["positional"][:n_pos])
+        missing = [
+            name for name in spec["required_kw"]
+            if name not in supplied and name not in bound_positionally
+        ]
+        if missing:
+            findings.append(Finding(
+                severity="error", code="ctx_call_missing_required",
+                message=f"{call} is missing required argument(s): {', '.join(missing)}.",
+                path=path, line=getattr(node, "lineno", None),
+                hint="These are keyword-only with no default; the call raises TypeError without them.",
+            ))
+    return findings
+
+
+def _scan_plugin_sql(path: str, data: bytes) -> list[Finding]:
+    """Dry-run every literal SQL string through the sandbox's own validator.
+
+    The runtime rejects statements the corpus never warned about — most often a
+    multi-statement migration string, or a CTE (``WITH ...``), whose leading
+    keyword is not on the allowlist. Both are invisible to every other check
+    here and both take the plugin's whole schema down at first run.
+
+    Only string literals passed straight to a ``*.sql.execute/query(...)`` call
+    (directly, or via a module-level constant) are checked, so dynamically built
+    SQL is never guessed at.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(data, filename=path)
+    except SyntaxError:
+        return []
+
+    # Module-level `NAME = "...sql..."` so `self.sql.execute(_MIGRATION)` resolves.
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    constants[tgt.id] = node.value.value
+
+    findings: list[Finding] = []
+    seen: set[tuple[int, str]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in _SQL_EXEC_METHODS or not node.args:
+            continue
+        # Receiver must be a `.sql` handle — ctx.sql, self.sql, self._sql, db.sql.
+        chain = _attr_chain(node.func.value)
+        if not chain or not chain[-1].lstrip("_").endswith("sql"):
+            continue
+
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            sql_text = arg.value
+        elif isinstance(arg, ast.Name) and arg.id in constants:
+            sql_text = constants[arg.id]
+        else:
+            continue
+        if not sql_text.strip():
+            continue
+
+        try:
+            _validate_plugin_sql(sql_text)
+        except ValueError as exc:
+            line = getattr(node, "lineno", None)
+            key = (line or 0, str(exc))
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(Finding(
+                severity="error", code="plugin_sql_rejected",
+                message=f"This SQL is rejected by the sandbox: {exc}",
+                path=path, line=line,
+                hint=(
+                    "The sandbox runs one statement per call and only allows "
+                    "SELECT, INSERT, UPDATE, DELETE, CREATE/ALTER/DROP TABLE and "
+                    "CREATE/DROP INDEX as the leading keyword. Split multi-statement "
+                    "migrations into one execute() per statement, and rewrite CTEs "
+                    "(WITH ...) as subqueries."
+                ),
+            ))
+        except Exception:  # pragma: no cover - never fail validation over a lint
+            continue
+    return findings
 
 
 def _scan_forbidden_patterns(path: str, data: bytes) -> list[Finding]:

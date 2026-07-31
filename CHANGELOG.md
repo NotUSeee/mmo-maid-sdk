@@ -3,6 +3,37 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.9.0]
+
+### Added
+
+- **`ctx.sql.query()` now reports truncation.** It returns a `QueryResult` — a
+  plain `list` of row dicts that also carries `.truncated`, True when the host
+  clipped the result at the requested `limit`. The host has always computed the
+  flag; the SDK dropped it, so a query that silently lost rows was
+  indistinguishable from a complete one. `QueryResult` subclasses `list`, so
+  iteration, indexing, `len()` and `==` against a plain list are unchanged and
+  no existing code needs to be touched. Exported as `yourbot_sdk.QueryResult`.
+- **`ctx.kv.list(start_after=...)` for pagination.** The host caps `list()` at
+  100 keys per call, and the cursor that pages past that was implemented in the
+  platform but never forwarded through the RPC layer, so keys 101+ were
+  unreachable from inside a plugin. Pass the last key you received to get the
+  next page.
+- **`allowed_mentions` on `ctx.discord.send_message` and `edit_message`.** The
+  host has always accepted and sanitized it on both actions, but the SDK did
+  not expose the parameter, so passing it raised
+  `TypeError: unexpected keyword argument 'allowed_mentions'`. Omit it and
+  nothing pings (the host default is `{"parse": []}`); `everyone`/`here` are
+  always stripped host-side and cannot be triggered from a plugin.
+
+### Fixed
+
+- **`ctx.kv.list` documented and mocked its real cap.** The docstring promised
+  "up to 1000 results" while the host clamps to 100, so plugins that swept a
+  prefix silently processed only the first 100 keys and reported success.
+  `MockContext` now clamps to 100 as well, so a plugin that only works because
+  the mock returned more keys fails in tests rather than in production.
+
 ## [0.8.5]
 
 ### Added
