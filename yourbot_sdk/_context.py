@@ -959,6 +959,28 @@ class _HttpApi:
     ) -> Dict[str, Any]:
         return self.request("POST", url, headers=headers, body=body, params=params)
 
+    def allow_host(self, host: str) -> Dict[str, Any]:
+        """Authorize THIS server for HTTP requests to an admin-supplied host.
+
+        Your ``proxy_domains_requested`` is fixed when you publish, so it can
+        never name a destination only the installing server knows — their own
+        game-server panel, their self-hosted API. Ask for the address in a
+        setup command and pass it here: the platform verifies the caller is a
+        server admin (Manage Server) and that the host is public, then
+        remembers it for this server only.
+
+        Must be called from a slash-command handler invoked by an admin, or
+        from a dashboard handler where the platform verifies the viewer is a
+        manager. ``host`` may be an IP, ``ip:port``, hostname, or a URL (only
+        the host part is used). Matched exactly, so subdomains are NOT
+        included. Idempotent.
+        """
+        return self._t.call("http.allow_host", {"host": host}) or {}
+
+    def revoke_host(self, host: str) -> Dict[str, Any]:
+        """Revoke a previously approved HTTP host for this server (admin only)."""
+        return self._t.call("http.revoke_host", {"host": host}) or {}
+
 
 class _WsApi:
     """ctx.ws — persistent WebSocket connections (requires proxy:websocket).

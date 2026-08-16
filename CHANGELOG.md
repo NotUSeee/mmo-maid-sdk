@@ -3,6 +3,32 @@
 All notable changes to the YourBot SDK are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.10.0]
+
+### Added
+
+- **`ctx.http.allow_host(host)` / `ctx.http.revoke_host(host)`.** Your
+  `proxy_domains_requested` is fixed when you publish, so it can never name a
+  destination only the installing server knows: their own game-server panel,
+  their self-hosted API, their home lab. Plugins for that kind of upstream were
+  effectively unbuildable, because no static manifest can list a domain that
+  differs for every customer. Ask for the address in a setup command and pass it
+  here: the platform verifies the caller is a server admin (Manage Server) and
+  that the host resolves to a public address, then authorizes it for that server
+  alone.
+
+  Approved hosts are matched **exactly**, so approving `example.de` does not
+  authorize `panel.example.de` (approve each host you actually call). This is
+  deliberately stricter than the manifest allowlist, where a declared apex also
+  covers its subdomains: a manifest entry is a reviewed declaration by the
+  author, while `allow_host` is an admin naming one machine.
+
+  This is the same per-install host list `ctx.ws.allow_host()` already wrote to,
+  so a host approved through either call now works for both HTTP and WebSocket.
+  Each transport still requires its own capability, and `allow_host` itself is
+  gated on `proxy:http` so an HTTP-only plugin no longer has to request
+  `proxy:websocket` just to let an admin name an address.
+
 ## [0.9.0]
 
 ### Added
